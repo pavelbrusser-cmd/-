@@ -7,7 +7,8 @@ not implemented yet. Nothing is persisted by this module.
 
 Limits reject the entire collection rather than returning incomplete data.
 Response size is checked after receipt, before the DAV parser processes it;
-this is not a streaming network or memory quota.
+this is not a streaming network or memory quota. Parsed DAV objects are released
+before the next calendar is fetched, but one complete REPORT is still buffered.
 """
 
 from contextlib import contextmanager
@@ -54,10 +55,17 @@ def _quiet_library_logs():
     # DAV libraries can log raw responses, including event contents. Collection
     # is synchronous; restore the application's logging threshold on every exit.
     previous = logging.root.manager.disable
+    response_logger = logging.getLogger("caldav.response")
+    previous_response_level = response_logger.level
+    # caldav 3.4 checks this logger's numeric level before serializing the whole
+    # XML response for debug logging. disable() alone suppresses the output but
+    # still lets that otherwise unnecessary full-document allocation happen.
+    response_logger.setLevel(logging.CRITICAL)
     logging.disable(logging.CRITICAL)
     try:
         yield
     finally:
+        response_logger.setLevel(previous_response_level)
         logging.disable(previous)
 
 
@@ -155,28 +163,40 @@ def collect_all() -> Collection:
                         # resources and overrides moved arbitrarily far away.
                         first_report = len(report_counts)
                         records = calendar.search(event=True, expand=False)
-                        if len(records) != sum(report_counts[first_report:]):
-                            raise CalendarConnectionError("Обработаны не все записи календаря; сбор остановлен.")
-                        for record in records:
-                            if len(resources) >= MAX_RESOURCES:
-                                raise CollectionLimitError("Число записей календарей превышает лимит; сбор остановлен.")
-                            data = record.data
-                            if isinstance(data, bytes):
-                                data = data.decode("utf-8")
-                            if not isinstance(data, str) or not data.strip():
-                                raise CalendarConnectionError("Календарь вернул пустую запись; сбор остановлен.")
-                            total_bytes += len(data.encode("utf-8"))
-                            if total_bytes > MAX_TOTAL_BYTES:
-                                raise CollectionLimitError("Общий объём календарей превышает лимит; сбор остановлен.")
-                            if not Calendar.from_ical(data).walk("VEVENT"):
-                                raise CalendarConnectionError("CalDAV вернул запись без события VEVENT; сбор остановлен.")
-                            resources.append(CalendarResource(
-                                source_id=source_id,
-                                calendar_id=calendar_id,
-                                calendar_name=calendar_name,
-                                account_email=credentials.username,
-                                data=data,
-                            ))
+                        try:
+                            if len(records) != sum(report_counts[first_report:]):
+                                raise CalendarConnectionError("Обработаны не все записи календаря; сбор остановлен.")
+                            for record in records:
+                                if len(resources) >= MAX_RESOURCES:
+                                    raise CollectionLimitError("Число записей календарей превышает лимит; сбор остановлен.")
+                                data = record.data
+                                if isinstance(data, bytes):
+                                    data = data.decode("utf-8")
+                                if not isinstance(data, str) or not data.strip():
+                                    raise CalendarConnectionError("Календарь вернул пустую запись; сбор остановлен.")
+                                total_bytes += len(data.encode("utf-8"))
+                                if total_bytes > MAX_TOTAL_BYTES:
+                                    raise CollectionLimitError("Общий объём календарей превышает лимит; сбор остановлен.")
+                                if not Calendar.from_ical(data).walk("VEVENT"):
+                                    raise CalendarConnectionError("CalDAV вернул запись без события VEVENT; сбор остановлен.")
+                                resources.append(CalendarResource(
+                                    source_id=source_id,
+                                    calendar_id=calendar_id,
+                                    calendar_name=calendar_name,
+                                    account_email=credentials.username,
+                                    data=data,
+                                ))
+                        finally:
+                            # Extra server properties (e.g. getetag) remain lxml
+                            # elements in caldav's Event.props. One such element
+                            # retains the complete REPORT tree. Do not carry it,
+                            # or the result list/last loop variable, into the
+                            # next search, which buffers another full response.
+                            for record in records:
+                                record.props.clear()
+                            records.clear()
+                            record = None
+                            del records
         except CalendarConnectionError:
             raise
         except Exception:

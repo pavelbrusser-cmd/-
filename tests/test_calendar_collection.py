@@ -4,12 +4,15 @@ import base64
 import logging
 import os
 import unittest
+import weakref
 from unittest.mock import patch
 from xml.etree import ElementTree
 from xml.sax.saxutils import escape
 
 import niquests
+from caldav.collection import Calendar as DAVCalendar
 from icalendar import Calendar
+from lxml import etree
 
 from calendar_digest.calendar_collection import (
     CollectionLimitError,
@@ -174,6 +177,54 @@ class CalendarCollectionTests(unittest.TestCase):
         self.assertEqual(logging.root.manager.disable, previous_logging)
         for private in (PASSWORD, "private-response", "https://", "example.invalid"):
             self.assertNotIn(private, str(error.exception))
+
+    def test_dav_objects_and_xml_properties_are_released_before_next_search(self):
+        # Include records in the final calendar as well: it must be released
+        # before collect_all returns, not merely replaced by the next search.
+        self.raw_records.update(mailru_2=RAW_EXCEPTION, mailru_3=RAW_EXCEPTION)
+        original_search = DAVCalendar.search
+        record_refs = []
+        retained_property_dicts = []
+
+        def search(calendar, *args, **kwargs):
+            self.assertTrue(all(ref() is None for ref in record_refs))
+            self.assertTrue(all(not props for props in retained_property_dicts))
+            records = original_search(calendar, *args, **kwargs)
+            for record in records:
+                # Real CalDAV parsing leaves this unrequested property as an
+                # XML element, which otherwise retains the entire REPORT.
+                self.assertIsInstance(record.props["{DAV:}getetag"], etree._Element)
+                retained_property_dicts.append(record.props)
+                record_refs.append(weakref.ref(record))
+            return records
+
+        with patch.object(DAVCalendar, "search", autospec=True, side_effect=search):
+            collection = collect_all()
+
+        self.assertEqual(len(collection.resources), 4)
+        self.assertEqual(len(record_refs), 4)
+        self.assertTrue(all(ref() is None for ref in record_refs))
+        self.assertTrue(all(not props for props in retained_property_dicts))
+        self.assertEqual(len(Calendar.from_ical(collection.resources[0].data).walk("VEVENT")), 3)
+
+    def test_suppressed_debug_logging_does_not_serialize_full_response(self):
+        logger = logging.getLogger("caldav.response")
+        previous_level = logger.level
+        self.addCleanup(logger.setLevel, previous_level)
+        logger.setLevel(logging.NOTSET)
+        original_tostring = etree.tostring
+
+        def tostring(element, *args, **kwargs):
+            self.assertNotEqual(element.tag, "{DAV:}multistatus")
+            return original_tostring(element, *args, **kwargs)
+
+        with patch("caldav.response.etree.tostring", side_effect=tostring):
+            collect_all()
+            self.assertEqual(logger.level, logging.NOTSET)
+            self.fail_source = "mailru_3"
+            with self.assertRaises(CalendarConnectionError):
+                collect_all()
+        self.assertEqual(logger.level, logging.NOTSET)
 
     def test_resource_and_total_byte_limits_abort_instead_of_truncating(self):
         for constant, limit in (("MAX_RESOURCES", 1), ("MAX_TOTAL_BYTES", 1)):

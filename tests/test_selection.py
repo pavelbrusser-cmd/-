@@ -3,7 +3,11 @@
 from dataclasses import asdict, dataclass, replace
 from datetime import date, datetime
 import json
+import tracemalloc
 import unittest
+from unittest.mock import patch
+
+import recurring_ical_events
 
 from calendar_digest.selection import SelectionError, select_day
 
@@ -279,6 +283,69 @@ class SelectionTests(unittest.TestCase):
         conflicting = resource(event("version", "DTSTART:20261014T110000Z", "SEQUENCE:2"))
         with self.assertRaises(SelectionError):
             select_day([high, conflicting], DAY)
+
+    def test_streaming_groups_preserve_split_overrides_multiuid_and_escaped_uid(self):
+        master = resource(
+            event("escaped\\,uid", "DTSTART:20261012T090000Z", "RRULE:FREQ=DAILY;COUNT=4", "SUMMARY:Master"),
+            event("other", "DTSTART:20261014T130000Z", "SUMMARY:Other"),
+        )
+        override = resource(event("escaped\\,uid", "RECURRENCE-ID:20261014T090000Z",
+                                  "DTSTART:20261016T090000Z", "SUMMARY:Moved", "SEQUENCE:2"))
+        results = select_day(iter([override, master]), DAY)
+        self.assertEqual({item.uid for item in results}, {"escaped,uid", "other"})
+        moved = next(item for item in results if item.uid == "escaped,uid")
+        self.assertEqual(moved.title, "Moved")
+        self.assertEqual(moved.original_start, "2026-10-14T12:00:00+03:00")
+        self.assertEqual(moved.start, "2026-10-16T12:00:00+03:00")
+
+    def test_compact_history_still_rejects_conflicting_previous_versions(self):
+        old = resource(event("previous", "DTSTART:20261014T090000Z", "SUMMARY:First"))
+        conflict = resource(event("previous", "DTSTART:20261014T090000Z", "SUMMARY:Conflict"))
+        current = resource(event("previous", "DTSTART:20261016T090000Z"))
+        with self.assertRaises(SelectionError):
+            select_day([current], DAY, iter([old, conflict]))
+
+    def test_current_custom_timezone_precedes_historical_definition(self):
+        zone_id = "Custom/SelectionCurrentBeforeHistory"
+        def with_zone(offset):
+            timezone = "\r\n".join([
+                "BEGIN:VTIMEZONE", "TZID:" + zone_id, "BEGIN:STANDARD",
+                "DTSTART:19700101T000000", "TZOFFSETFROM:" + offset,
+                "TZOFFSETTO:" + offset, "END:STANDARD", "END:VTIMEZONE",
+            ])
+            return resource(timezone, event("custom-zone", f"DTSTART;TZID={zone_id}:20261014T090000"))
+        result, = select_day([with_zone("+0300")], DAY, [with_zone("+0100")])
+        self.assertEqual(result.start, "2026-10-14T09:00:00+03:00")
+        self.assertIsNone(result.move_basis)
+
+    def test_large_history_does_not_retain_full_event_graphs(self):
+        # Descriptions are deliberately large: the input already exists, while
+        # selection should retain only one parsed series and compact old times.
+        rows = [resource(event(str(index), "DTSTART:20200101T090000Z",
+                               "DESCRIPTION:" + "synthetic " * 700)) for index in range(240)]
+        tracemalloc.start()
+        try:
+            self.assertEqual(select_day(iter(rows), DAY, iter(rows)), [])
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertLess(peak, 2 * 1024 * 1024)
+
+    def test_old_daily_recurrence_has_no_historical_datetime_cache(self):
+        data = resource(event("old-daily", "DTSTART:20000101T090000Z", "RRULE:FREQ=DAILY"))
+        queries = []
+        original = recurring_ical_events.of
+        def track(*args, **kwargs):
+            query = original(*args, **kwargs)
+            queries.append(query)
+            return query
+        with patch("calendar_digest.selection.recurring_ical_events.of", side_effect=track):
+            result, = select_day([data], DAY)
+        self.assertEqual(result.start, "2026-10-14T12:00:00+03:00")
+        for query in queries:
+            for series in query.series:
+                for rule in series.recurrence.rrules[1:]:
+                    self.assertIsNone(rule._cache)
 
     def test_unsupported_range_and_whole_series_move_fail_explicitly(self):
         ranged = resource(event("range", "DTSTART:20261014T090000Z",
