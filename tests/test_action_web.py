@@ -189,13 +189,13 @@ class ActionWebTests(unittest.TestCase):
         self.post(path, fields)
         self.assertEqual(self.calendar.writes, 1)
 
-    def test_mail_status_cancel_is_blocked_before_confirmation_and_write(self):
+    def test_mail_cancel_without_delete_permission_is_blocked_before_write(self):
         self.calendar.version = replace(self.calendar.version, source_id='mailru_1')
         target = replace(self.target, source_id='mailru_1')
         path = self.link('cancel', target)
         response = self.login(path)
         self.assertEqual(response.status_code, 400)
-        self.assertIn('пока недоступна', response.get_data(as_text=True))
+        self.assertIn('Право удаления', response.get_data(as_text=True))
         self.assertNotIn('name="operation" value="apply"', response.get_data(as_text=True))
         self.assertEqual(self.store.read(path[3:])['state'], 'ready')
         self.assertEqual(self.calendar.writes, 0)

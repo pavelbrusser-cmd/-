@@ -1,9 +1,10 @@
 """Fresh reads and narrowly scoped, conditional CalDAV event updates.
 
-No calendar creation/deletion or invitation scheduling is implemented here. A
-write always rediscovers the resource, compares its strong ETag, performs one
-conditional PUT, and verifies the stored VEVENT data with a fresh GET. Unknown
-ACL support requires an explicitly verified provider configuration.
+No calendar creation/deletion or invitation scheduling is implemented here.
+Event writes rediscover the resource, compare its strong ETag, perform one
+conditional request, and verify the result with a fresh GET. Event DELETE is
+restricted to standalone, attendee-free personal Mail.ru events with a confirmed
+parent collection unbind privilege; unknown ACL never permits deletion.
 """
 
 from dataclasses import dataclass, field
@@ -40,7 +41,7 @@ class CalDAVConflict(CalDAVActionError):
 
 
 class CalDAVUncertain(CalDAVActionError):
-    """A PUT may have succeeded; do not automatically repeat it."""
+    """A mutation may have succeeded; do not automatically repeat it."""
 
 
 @dataclass(frozen=True)
@@ -58,6 +59,7 @@ class ResourceVersion:
     automatic_scheduling: bool = False
     account_addresses: tuple[str, ...] = field(default=(), repr=False)
     status_cancellation_supported: bool = True
+    can_delete: bool = False
 
     @property
     def can_write(self):
@@ -129,6 +131,33 @@ class ScopedWriteSession(niquests.Session):
             kwargs['allow_redirects'] = False
         elif request.method not in {'GET', 'REPORT', 'PROPFIND', 'OPTIONS'}:
             raise CalDAVActionError('Этот метод изменения календаря не разрешён.')
+        kwargs['verify'] = True
+        kwargs['timeout'] = ACTION_TIMEOUT_SECONDS
+        if self.auth is not None:
+            self.auth(request)
+        return super().send(request, **kwargs)
+
+
+class ScopedDeleteSession(niquests.Session):
+    """One exact conditional event DELETE and its exact-URL verification GET.
+
+    Discovery happens in a separate read-only provider session. This transport
+    cannot send credentials to a different resource or follow a redirect.
+    """
+
+    def __init__(self, *, hostname_pattern, resource_url, etag):
+        super().__init__(retries=False)
+        self.hostname_pattern = hostname_pattern
+        self.resource_url = _prepared_url(resource_url, hostname_pattern)
+        self.etag = _strong_etag(etag)
+
+    def send(self, request, **kwargs):
+        _valid_url(request.url, self.hostname_pattern)
+        if request.url != self.resource_url or request.method not in {'DELETE', 'GET'}:
+            raise CalDAVActionError('Удаление разрешено только для подтверждённого события.')
+        if request.method == 'DELETE' and request.headers.get('If-Match') != self.etag:
+            raise CalDAVActionError('Удаление требует подтверждённой версии события.')
+        kwargs['allow_redirects'] = False
         kwargs['verify'] = True
         kwargs['timeout'] = ACTION_TIMEOUT_SECONDS
         if self.auth is not None:
@@ -271,7 +300,7 @@ def _depth_zero_response(response, requested_url):
     return matches[0]
 
 
-def _calendar_writable(session, calendar_url):
+def _calendar_privileges(session, calendar_url):
     body = '<d:propfind xmlns:d="DAV:"><d:prop><d:current-user-privilege-set/></d:prop></d:propfind>'
     response = _request(session, 'PROPFIND', calendar_url, data=body, headers={
         'Depth': '0', 'Content-Type': 'application/xml; charset=utf-8',
@@ -286,9 +315,23 @@ def _calendar_writable(session, calendar_url):
                 continue
             privileges = propstat.find(_DAV + 'prop/' + _DAV + 'current-user-privilege-set')
             if privileges is not None:
-                names = {child.tag for child in privileges.findall(_DAV + 'privilege/*')}
-                return bool(names & {_DAV + 'all', _DAV + 'write', _DAV + 'write-content'})
+                return {child.tag for child in privileges.findall(_DAV + 'privilege/*')}
     return None
+
+
+def _calendar_writable(session, calendar_url):
+    names = _calendar_privileges(session, calendar_url)
+    if names is None:
+        return None
+    return bool(names & {_DAV + 'all', _DAV + 'write', _DAV + 'write-content'})
+
+
+def _calendar_can_delete(session, calendar_url):
+    # DELETE removes the binding from the parent collection. Resource
+    # write-content is insufficient. RFC 3744 collection write aggregates
+    # unbind (and all includes write); no configured ACL fallback applies.
+    names = _calendar_privileges(session, calendar_url)
+    return names is not None and bool(names & {_DAV + 'unbind', _DAV + 'write', _DAV + 'all'})
 
 
 def _principal_addresses(client):
@@ -439,14 +482,18 @@ def _matching_report_url(response, calendar_url, uid, hostname_pattern, *, compl
             if complete_data:
                 _events(data[0], uid)
             matches.append(url)
+    if not matches:
+        raise CalDAVConflict('Событие больше не найдено; обновите дайджест.')
     if len(matches) != 1:
         raise CalDAVActionError('Событие не найдено однозначно; обновите дайджест.')
     return matches[0]
 
 
 def _read_resource(session, url, *, target, account_email, calendar_name, writable,
-                   account_addresses=(), automatic_scheduling=False):
+                   account_addresses=(), automatic_scheduling=False, can_delete=False):
     response = _request(session, 'GET', url)
+    if response.status_code == 404:
+        raise CalDAVConflict('Событие больше не найдено; обновите дайджест.')
     if response.status_code != 200:
         raise CalDAVActionError('Не удалось прочитать текущую версию события.')
     try:
@@ -467,6 +514,7 @@ def _read_resource(session, url, *, target, account_email, calendar_name, writab
         can_organize=can_organize, account_addresses=account_addresses,
         automatic_scheduling=automatic_scheduling,
         status_cancellation_supported=target.source_id == 'icloud',
+        can_delete=can_delete,
     )
 
 
@@ -502,12 +550,15 @@ class CalDAVActionBackend:
                         writable = _calendar_writable(client.session, url)
                     addresses = _principal_addresses(client)
                     automatic_scheduling = _automatic_scheduling(client.session, url)
+                    can_delete = (target.source_id in {'mailru_1', 'mailru_2', 'mailru_3'}
+                                  and _calendar_can_delete(client.session, url))
                     return _read_resource(
                         client.session, resource_url, target=target,
                         account_email=credentials.username,
                         calendar_name=calendar.get_display_name() or 'Без названия',
                         writable=writable,
                         account_addresses=addresses, automatic_scheduling=automatic_scheduling,
+                        can_delete=can_delete,
                     )
             except CalDAVActionError:
                 raise
@@ -568,7 +619,8 @@ class CalDAVActionBackend:
                         stored = _read_resource(session, fresh.resource_url, target=target,
                             account_email=fresh.account_email, calendar_name=fresh.calendar_name,
                             writable=fresh.writable, account_addresses=fresh.account_addresses,
-                            automatic_scheduling=fresh.automatic_scheduling)
+                            automatic_scheduling=fresh.automatic_scheduling,
+                            can_delete=fresh.can_delete)
                         verified = (verify(stored.data) if verify is not None else
                                     _event_fingerprint(stored.data, target.uid) == expected)
                         if (not verified
@@ -589,3 +641,73 @@ class CalDAVActionBackend:
                 raise
             except Exception:
                 raise CalDAVActionError('Не удалось безопасно изменить событие.') from None
+
+    def delete(self, target: 'EventTarget', version: ResourceVersion) -> None:
+        """Delete one personal event once, requiring an explicit success and 404.
+
+        A missing resource before DELETE is a conflict. A timeout, redirect,
+        asynchronous acceptance or ambiguous server result stays uncertain even
+        if another client might subsequently remove the resource; neither this
+        method nor its transport retries the mutation.
+        """
+        with _quiet_library_logs():
+            try:
+                from .personal_cancellation import prepare_personal_cancellation
+
+                if ((version.source_id, version.calendar_id, version.uid)
+                        != (target.source_id, target.calendar_id, target.uid)):
+                    raise CalDAVActionError('Версия относится к другому событию.')
+                _strong_etag(version.etag)
+                initial = prepare_personal_cancellation(
+                    version.data, target, version.account_email,
+                    allow_organizer_updates=version.can_organize,
+                )
+                if initial.method != 'DELETE':
+                    raise CalDAVActionError('Удаление серии событий через эту операцию запрещено.')
+                if version.writable is not True or version.can_delete is not True:
+                    raise CalDAVActionError('Право удаления этого события не подтверждено.')
+                fresh = self.read(target)
+                if (fresh.etag != version.etag or fresh.resource_url != version.resource_url
+                        or not _same_revision_data(fresh.data, version.data, target)):
+                    raise CalDAVConflict('Событие уже изменилось. Откройте форму заново.')
+                if fresh.writable is not True or fresh.can_delete is not True:
+                    raise CalDAVActionError('Право удаления этого события не подтверждено.')
+                current = prepare_personal_cancellation(
+                    fresh.data, target, fresh.account_email,
+                    allow_organizer_updates=fresh.can_organize,
+                )
+                if current.method != 'DELETE':
+                    raise CalDAVActionError('Удаление серии событий через эту операцию запрещено.')
+                credentials, _, pattern = _source(target.source_id)
+                with ScopedDeleteSession(hostname_pattern=pattern,
+                        resource_url=fresh.resource_url, etag=fresh.etag) as session:
+                    session.auth = HTTPBasicAuth(credentials.username, credentials.app_password)
+                    try:
+                        response = _request(session, 'DELETE', fresh.resource_url,
+                            headers={'If-Match': fresh.etag})
+                    except Exception:
+                        raise CalDAVUncertain(
+                            'Результат удаления не подтверждён. Не повторяйте действие; проверьте календарь.'
+                        ) from None
+                    if response.status_code == 412:
+                        raise CalDAVConflict('Событие изменилось перед удалением. Откройте форму заново.')
+                    if response.status_code in {401, 403, 405}:
+                        raise CalDAVActionError('Сервер не разрешил удаление события.')
+                    if response.status_code == 404:
+                        raise CalDAVConflict('Событие исчезло перед удалением; обновите дайджест.')
+                    if response.status_code not in {200, 204}:
+                        raise CalDAVUncertain(
+                            'Сервер не подтвердил удаление. Не повторяйте действие; проверьте календарь.'
+                        )
+                    try:
+                        stored = _request(session, 'GET', fresh.resource_url)
+                        if stored.status_code != 404:
+                            raise ValueError
+                    except Exception:
+                        raise CalDAVUncertain(
+                            'Удаление не подтверждено повторным чтением. Не повторяйте действие; проверьте календарь.'
+                        ) from None
+            except CalDAVActionError:
+                raise
+            except Exception:
+                raise CalDAVActionError('Не удалось безопасно удалить событие.') from None

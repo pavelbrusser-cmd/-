@@ -109,6 +109,20 @@ class ActionStore:
                     result_json TEXT
                 )
             """)
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS cancellation_archive (
+                    action_id TEXT PRIMARY KEY REFERENCES actions(id),
+                    event_json TEXT NOT NULL,
+                    original_data TEXT NOT NULL,
+                    staged_at REAL NOT NULL
+                )
+            """)
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS action_contexts (
+                    action_id TEXT PRIMARY KEY REFERENCES actions(id),
+                    event_json TEXT NOT NULL
+                )
+            """)
 
     @contextmanager
     def _connection(self):
@@ -116,6 +130,7 @@ class ActionStore:
         try:
             connection = sqlite3.connect(self.path, timeout=5, isolation_level=None)
             connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys=ON")
             yield connection
         except sqlite3.OperationalError:
             raise StoreError("Хранилище действий занято или недоступно; повторите позже.") from None
@@ -149,8 +164,14 @@ class ActionStore:
             raise StoreError("Срок действия ссылки истёк.")
         return row
 
-    def issue(self, target: dict, action: str, ttl_seconds: int = 48 * 3600) -> str:
+    def issue(self, target: dict, action: str, ttl_seconds: int = 48 * 3600, *, digest_event=None) -> str:
         target_json = _json(target, target=True)
+        context = None
+        if digest_event is not None:
+            from .cancellation_archive import digest_event_json, validate_context
+
+            context = digest_event_json(digest_event)
+            validate_context(context, target)
         if not isinstance(action, str) or _ACTION.fullmatch(action) is None:
             raise StoreError("Некорректное действие.")
         if type(ttl_seconds) is not int or not 0 < ttl_seconds <= 2**31:
@@ -158,11 +179,18 @@ class ActionStore:
         identifier = secrets.token_urlsafe(32)
         created = time.time()
         with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             connection.execute(
                 "INSERT INTO actions (id,target_json,action,created_at,expires_at,state) "
                 "VALUES (?,?,?,?,?,'ready')",
                 (identifier, target_json, action, created, created + ttl_seconds),
             )
+            if context is not None:
+                connection.execute(
+                    "INSERT INTO action_contexts (action_id,event_json) VALUES (?,?)",
+                    (identifier, context),
+                )
+            connection.commit()
         return identifier + "." + self._signature(identifier)
 
     def read(self, token: str) -> dict:
@@ -196,6 +224,58 @@ class ActionStore:
 
     def complete(self, token: str, result: dict):
         self._finish(token, result, state="done")
+
+    def stage_cancellation(self, token: str, event, original_data: str) -> None:
+        """Commit a private backup before deleting/excluding an occurrence.
+
+        Only a successful action receipt makes this row visible to previews.
+        Thus a crash or an uncertain calendar response cannot claim cancellation.
+        Raw iCalendar is confined to this backup table, never action results.
+        """
+        from .cancellation_archive import cancellation_json, enrich_cancellation, validate_backup
+
+        identifier = self._identifier(token)
+        event_json = cancellation_json(event)
+        original_status = validate_backup(original_data, event)
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = self._row(connection, identifier, check_expiry=False)
+            if row["action"] != "cancel" or row["state"] != "running":
+                raise StoreError("Архив отмены требует начатого действия отмены.")
+            try:
+                target = json.loads(row["target_json"])
+                _json(target, target=True)
+            except (TypeError, ValueError, RecursionError):
+                raise StoreError("Сохранённое состояние действия повреждено.") from None
+            expected = {
+                "source_id": event.source_id, "calendar_id": event.calendar_id,
+                "uid": event.uid, "recurrence_id": event.recurrence_id,
+                "expected_start": event.start, "expected_end": event.end,
+                "expected_participation": event.participation,
+            }
+            if (any(target[name] != value for name, value in expected.items())
+                or target["expected_event_status"] == "CANCELLED"
+                or target["expected_event_status"] != original_status):
+                raise StoreError("Архив отмены не соответствует выбранному событию.")
+            context = connection.execute(
+                "SELECT event_json FROM action_contexts WHERE action_id=?", (identifier,),
+            ).fetchone()
+            if context is not None:
+                event = enrich_cancellation(event, context["event_json"], target)
+                event_json = cancellation_json(event)
+            existing = connection.execute(
+                "SELECT event_json,original_data FROM cancellation_archive WHERE action_id=?",
+                (identifier,),
+            ).fetchone()
+            if existing is not None:
+                if existing["event_json"] != event_json or existing["original_data"] != original_data:
+                    raise StoreError("Сохранённую копию отмены нельзя заменить.")
+            else:
+                connection.execute(
+                    "INSERT INTO cancellation_archive (action_id,event_json,original_data,staged_at) VALUES (?,?,?,?)",
+                    (identifier, event_json, original_data, time.time()),
+                )
+            connection.commit()
 
     def fail(self, token: str, result: dict, *, uncertain=False):
         self._finish(token, result, state="uncertain" if uncertain else "failed")

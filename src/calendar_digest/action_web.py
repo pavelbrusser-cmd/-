@@ -1,6 +1,7 @@
 """Owner-authenticated confirmation pages for single-use calendar actions."""
 
 from datetime import date, datetime, timedelta
+from dataclasses import replace
 import hashlib
 import hmac
 import os
@@ -14,6 +15,7 @@ from werkzeug.exceptions import HTTPException
 
 from .action_store import ActionStore, StoreError
 from .event_actions import EventTarget, SafeActionError, ActionConflict, prepare_change, verify_change
+from .personal_cancellation import prepare_personal_cancellation, verify_personal_cancellation
 from .selection import MOSCOW
 from .writable_caldav import (
     CalDAVActionBackend, CalDAVActionError, CalDAVConflict, CalDAVUncertain,
@@ -58,6 +60,8 @@ OPERATIONS = {
     'accept_invitation': ('Принять приглашение', 'Ваш ответ на приглашение изменится на «Принято».', 'Принять приглашение'),
     'decline_participation': ('Отклонить участие', 'Ваш ответ изменится на «Отклонено».', 'Отклонить участие'),
     'cancel_event': ('Отменить событие', 'Событие получит статус «Отменено» и останется в календаре.', 'Отменить событие'),
+    'delete_personal_event': ('Отменить событие', 'Личное событие будет удалено из календаря Mail.ru. Его копия сохранится в сервисе, и событие будет показано в дайджесте как отменённое.', 'Отменить и удалить из календаря'),
+    'exclude_personal_occurrence': ('Отменить это повторение', 'Выбранное повторение исчезнет из календаря Mail.ru. Его копия сохранится в сервисе и будет показана в дайджесте как отменённая.', 'Отменить только это повторение'),
     'reschedule': ('Перенести событие', 'Выберите новую дату и время события.', 'Сохранить новое время'),
 }
 
@@ -186,7 +190,17 @@ def create_app(config=None, backend=None):
                     values = _new_interval(target)
             change = prepare_change(version.data, target, record['action'], version.account_email,
                                     *values, allow_organizer_updates=version.can_organize)
-            validate_change_capability(version, change)
+            personal = (target.source_id in {'mailru_1', 'mailru_2', 'mailru_3'}
+                        and change.operation == 'cancel_event')
+            if personal:
+                change = prepare_personal_cancellation(
+                    version.data, target, version.account_email,
+                    allow_organizer_updates=version.can_organize,
+                )
+                if change.method == 'DELETE' and version.can_delete is not True:
+                    raise SafeActionError('Право удаления личного события из этого календаря не подтверждено.')
+            else:
+                validate_change_capability(version, change)
             if request.method == 'GET':
                 heading, description, button = OPERATIONS[change.operation]
                 all_day = 'T' not in target.expected_start
@@ -201,14 +215,23 @@ def create_app(config=None, backend=None):
             if not store.claim(token):
                 return terminal(store.read(token))
             claimed = True
+            if personal:
+                store.stage_cancellation(
+                    token, replace(change.event, calendar_name=version.calendar_name), version.data,
+                )
             write_started = True
-            stored = calendar.write(target, version, change.data,
-                verify=lambda actual: verify_change(actual, target, change, version.account_email))
-            if not verify_change(stored.data, target, change, version.account_email):
-                raise CalDAVUncertain('Результат записи не подтверждён. Проверьте календарь.')
+            if personal and change.method == 'DELETE':
+                calendar.delete(target, version)
+            else:
+                verifier = verify_personal_cancellation if personal else verify_change
+                stored = calendar.write(target, version, change.data,
+                    verify=lambda actual: verifier(actual, target, change, version.account_email))
+                if not verifier(stored.data, target, change, version.account_email):
+                    raise CalDAVUncertain('Результат записи не подтверждён. Проверьте календарь.')
             result = {'message': change.summary, 'title': change.title,
                       'before': _interval(change.before_start, change.before_end),
-                      'after': _interval(change.after_start, change.after_end), 'operation': change.operation}
+                      'after': ('Отменено · ' if personal else '') + _interval(change.after_start, change.after_end),
+                      'operation': change.operation}
             store.complete(token, result)
             return redirect(request.path, code=303)
         except (StoreError, SafeActionError, CalDAVActionError) as exc:
@@ -225,7 +248,7 @@ def create_app(config=None, backend=None):
             status = 409 if isinstance(exc, (ActionConflict, CalDAVConflict)) else 400
             return page(status, heading='Изменение не подтверждено', message=message, error=True)
         except Exception:
-            # A crash after claiming can mean that PUT succeeded: never retry automatically.
+            # A crash after claiming can mean that a mutation succeeded: never retry automatically.
             if claimed:
                 try:
                     store.fail(token, {'message': 'Результат операции не подтверждён. Проверьте календарь.'}, uncertain=True)

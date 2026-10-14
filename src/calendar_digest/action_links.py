@@ -46,7 +46,7 @@ def issue_email(day: date, directory: Path = Path('.local'), *, state_dir=None, 
         target = EventTarget(event.source_id, event.calendar_id, event.uid, event.start, event.end,
                              event.recurrence_id, event.event_status, event.participation)
         for action in actions_for(event):
-            token = store.issue(asdict(target), action)
+            token = store.issue(asdict(target), action, digest_event=event)
             links[index, action] = f'{base}/a/{token}'
     html = render_email_html(events, day, first_snapshot=payload.get('first_snapshot', False), action_links=links)
     output = directory / f'email-actions-{day.isoformat()}.html'
