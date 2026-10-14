@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 
 from .calendar_collection import collect_all
+from .cancellation_archive import merge_cancellations
 from .local_state import advance_snapshot, read_snapshot, write_private, write_snapshot
 from .selection import DigestEvent, select_day
 from .email_html import render_email_html
@@ -132,6 +133,9 @@ def create_preview(
         first_snapshot = not old.current
         _report_progress(progress, PreviewStage.SELECT)
         events = select_day(collection.resources, day, previous_resources=snapshot.previous)
+        events = merge_cancellations(
+            events, collection.resources, day, Path(os.environ.get("DIGEST_STATE_DIR", directory)),
+        )
         _report_progress(progress, PreviewStage.RENDER)
         markdown = render_markdown(events, day, first_snapshot=first_snapshot)
         email_html = render_email_html(events, day, first_snapshot=first_snapshot)
