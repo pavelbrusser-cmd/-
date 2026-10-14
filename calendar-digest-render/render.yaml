@@ -1,0 +1,48 @@
+# Render Blueprint: one paid web service with persistent private state.
+# Import this file from GitHub in Render; no deployment is performed by this file alone.
+services:
+  - type: web
+    name: calendar-digest-actions
+    runtime: python
+    plan: 0.5c-512mb
+    region: frankfurt
+    branch: main
+    numInstances: 1
+    autoDeployTrigger: "off"
+    buildCommand: bash scripts/setup.sh
+    startCommand: >-
+      .venv/bin/gunicorn 'calendar_digest.action_web:create_app()'
+      --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 90
+      --access-logfile /dev/null --error-logfile -
+    healthCheckPath: /health
+    disk:
+      name: digest-private-state
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.14
+      - key: DIGEST_STATE_DIR
+        value: /var/data
+      # Render provides RENDER_EXTERNAL_URL; the application uses it as its public URL.
+      - key: DIGEST_ACTION_SECRET
+        generateValue: true
+      - key: DIGEST_WEB_PASSWORD
+        generateValue: true
+      # Enter these values in Render's protected configuration, never in Git or chat.
+      - key: ICLOUD_USERNAME
+        sync: false
+      - key: ICLOUD_APP_PASSWORD
+        sync: false
+      - key: MAILRU_1_USERNAME
+        sync: false
+      - key: MAILRU_1_APP_PASSWORD
+        sync: false
+      - key: MAILRU_2_USERNAME
+        sync: false
+      - key: MAILRU_2_APP_PASSWORD
+        sync: false
+      - key: MAILRU_3_USERNAME
+        sync: false
+      - key: MAILRU_3_APP_PASSWORD
+        sync: false

@@ -1,0 +1,100 @@
+"""Read-only calendar diagnostics and local digest previews."""
+
+import argparse
+from dataclasses import asdict
+from datetime import date, datetime, time, timedelta
+import json
+import logging
+import os
+from pathlib import Path
+import sys
+from zoneinfo import ZoneInfo
+
+from .icloud import Credentials, discover_calendars, probe_calendars
+from .mailru import (
+    MailRuCredentials,
+    discover_calendars as discover_mailru,
+    probe_calendars as probe_mailru,
+)
+from .readonly_caldav import CalendarConnectionError
+from .local_state import StateError
+from .preview import PreviewError, create_preview, render_saved_preview
+from .selection import SelectionError
+from .action_links import issue_email
+from .action_store import StoreError
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Подключение календарей для дайджеста")
+    commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("discover-icloud", help="Показать доступные календари iCloud")
+    mailru = commands.add_parser("discover-mailru", help="Показать доступные календари Mail.ru")
+    mailru.add_argument("--account", type=int, choices=(1, 2, 3), default=1,
+                        help="Номер учётной записи Mail.ru (по умолчанию 1)")
+    probe = commands.add_parser("probe-icloud", help="Проверить чтение событий без вывода их содержимого")
+    probe.add_argument("--days", type=int, default=30, help="Число дней начиная с завтра (1–31)")
+    probe_mail = commands.add_parser("probe-mailru", help="Проверить чтение событий Mail.ru")
+    probe_mail.add_argument("--account", type=int, choices=(1, 2, 3), default=1,
+                           help="Номер учётной записи Mail.ru (по умолчанию 1)")
+    probe_mail.add_argument("--days", type=int, default=30, help="Число дней начиная с завтра (1–31)")
+    preview = commands.add_parser("preview", help="Собрать локальный образец дайджеста без отправки письма")
+    preview.add_argument("--date", type=date.fromisoformat, metavar="YYYY-MM-DD",
+                         help="Дата по Москве (по умолчанию завтра)")
+    render = commands.add_parser("render-preview", help="Оформить сохранённый образец без чтения календарей")
+    render.add_argument("--date", type=date.fromisoformat, metavar="YYYY-MM-DD", required=True)
+    actions = commands.add_parser("issue-actions", help="Создать письмо со ссылками на размещённый сервис действий")
+    actions.add_argument("--date", type=date.fromisoformat, metavar="YYYY-MM-DD", required=True)
+    for command in (preview, render, actions):
+        command.add_argument("--directory", type=Path,
+                             default=Path(os.environ.get("DIGEST_STATE_DIR", ".local")),
+                             help="Приватная папка данных (по умолчанию DIGEST_STATE_DIR или .local)")
+    args = parser.parse_args(argv)
+    if args.command in {"probe-icloud", "probe-mailru"} and not 1 <= args.days <= 31:
+        parser.error("--days должно быть в диапазоне от 1 до 31")
+
+    # Library diagnostics can contain private DAV URLs or server response bodies.
+    for name in ("caldav", "niquests", "urllib3", "urllib3_future"):
+        logging.getLogger(name).addHandler(logging.NullHandler())
+        logging.getLogger(name).propagate = False
+
+    try:
+        if args.command == "issue-actions":
+            result = issue_email(args.date, args.directory)
+        elif args.command == "render-preview":
+            result = render_saved_preview(args.date, args.directory)
+        elif args.command == "preview":
+            day = args.date or (datetime.now(ZoneInfo("Europe/Moscow")).date() + timedelta(days=1))
+            result = create_preview(day, args.directory)
+        elif args.command == "discover-mailru":
+            credentials = MailRuCredentials.from_environment(args.account)
+            calendars = discover_mailru(credentials)
+            result = {"source": f"mailru_{args.account}", "calendars": [asdict(c) for c in calendars]}
+        elif args.command == "discover-icloud":
+            calendars = discover_calendars(Credentials.from_environment())
+            result = {"source": "icloud", "calendars": [asdict(c) for c in calendars]}
+        else:
+            zone = ZoneInfo("Europe/Moscow")
+            tomorrow = datetime.now(zone).date() + timedelta(days=1)
+            start = datetime.combine(tomorrow, time.min, tzinfo=zone)
+            end = start + timedelta(days=args.days)
+            if args.command == "probe-mailru":
+                credentials = MailRuCredentials.from_environment(args.account)
+                calendars = probe_mailru(credentials, start=start, end=end)
+                source = f"mailru_{args.account}"
+            else:
+                calendars = probe_calendars(Credentials.from_environment(), start=start, end=end)
+                source = "icloud"
+            result = {
+                "source": source, "window_start": start.isoformat(),
+                "window_end_exclusive": end.isoformat(),
+                "calendars": [asdict(c) for c in calendars],
+            }
+    except (CalendarConnectionError, SelectionError, StateError, PreviewError, StoreError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    except Exception:
+        # Do not expose raw exceptions containing request/response details.
+        print("Не удалось обработать ответ календаря; требуется диагностика адаптера.", file=sys.stderr)
+        return 1
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0

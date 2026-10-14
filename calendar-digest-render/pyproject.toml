@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "calendar-digest"
+version = "0.1.0"
+description = "Daily email digest from iCloud and Mail.ru calendars"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "caldav==3.4.0",
+    "icalendar==7.3.0",
+    "recurring-ical-events==3.8.2",
+    "Flask==3.1.2",
+    "gunicorn==23.0.0",
+]
+
+[project.scripts]
+calendar-digest = "calendar_digest.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
