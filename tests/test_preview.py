@@ -73,6 +73,11 @@ class SnapshotTests(unittest.TestCase):
 
 
 class PreviewTests(unittest.TestCase):
+    def setUp(self):
+        # Render exposes runtime settings while building, before /var/data is
+        # mounted. Each test must use only its own temporary state directory.
+        self.enterContext(patch.dict("os.environ", {}, clear=True))
+
     def test_preview_escapes_event_markup_and_returns_only_counters(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)
