@@ -30,17 +30,13 @@ def public_url(value):
     return value.rstrip('/')
 
 
-def issue_email(day: date, directory: Path = Path('.local'), *, state_dir=None, base_url=None, signing_key=None):
+def compose_action_email(day: date, events, *, first_snapshot=False,
+                         state_dir=None, base_url=None, signing_key=None):
+    """Build HTML from one captured selection without reading mutable outputs."""
+    events = list(events)
     base = public_url(base_url or os.environ.get('DIGEST_PUBLIC_URL') or os.environ.get('RENDER_EXTERNAL_URL', ''))
     key = signing_key or os.environ.get('DIGEST_ACTION_SECRET', '')
-    store = ActionStore(Path(state_dir or os.environ.get('DIGEST_STATE_DIR', directory)) / 'actions.sqlite3', key)
-    try:
-        payload = json.loads((directory / f'preview-{day.isoformat()}.json').read_text(encoding='utf-8'))
-        if payload['date'] != day.isoformat() or payload['timezone'] != 'Europe/Moscow':
-            raise ValueError
-        events = [DigestEvent(**item) for item in payload['events']]
-    except Exception:
-        raise StoreError('Сначала соберите образец дайджеста за выбранную дату.') from None
+    store = ActionStore(Path(state_dir or os.environ.get('DIGEST_STATE_DIR', '.local')) / 'actions.sqlite3', key)
     links = {}
     for index, event in enumerate(events):
         target = EventTarget(event.source_id, event.calendar_id, event.uid, event.start, event.end,
@@ -48,8 +44,23 @@ def issue_email(day: date, directory: Path = Path('.local'), *, state_dir=None, 
         for action in actions_for(event):
             token = store.issue(asdict(target), action, digest_event=event)
             links[index, action] = f'{base}/a/{token}'
-    html = render_email_html(events, day, first_snapshot=payload.get('first_snapshot', False), action_links=links)
+    html = render_email_html(events, day, first_snapshot=first_snapshot, action_links=links)
+    return html, {'date': day.isoformat(), 'events': len(events), 'action_links': len(links)}
+
+
+def issue_email(day: date, directory: Path = Path('.local'), *, state_dir=None, base_url=None, signing_key=None):
+    try:
+        payload = json.loads((directory / f'preview-{day.isoformat()}.json').read_text(encoding='utf-8'))
+        if payload['date'] != day.isoformat() or payload['timezone'] != 'Europe/Moscow':
+            raise ValueError
+        events = [DigestEvent(**item) for item in payload['events']]
+    except Exception:
+        raise StoreError('Сначала соберите образец дайджеста за выбранную дату.') from None
+    html, result = compose_action_email(
+        day, events, first_snapshot=payload.get('first_snapshot', False),
+        state_dir=state_dir or os.environ.get('DIGEST_STATE_DIR', directory),
+        base_url=base_url, signing_key=signing_key,
+    )
     output = directory / f'email-actions-{day.isoformat()}.html'
     write_private(output, html)
-    return {'date': day.isoformat(), 'events': len(events), 'action_links': len(links),
-            'email_html': str(output), 'sent': False}
+    return {**result, 'email_html': str(output), 'sent': False}

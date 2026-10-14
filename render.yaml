@@ -10,10 +10,7 @@ services:
     numInstances: 1
     autoDeployTrigger: "off"
     buildCommand: bash scripts/setup.sh
-    startCommand: >-
-      .venv/bin/gunicorn 'calendar_digest.action_web:create_app()'
-      --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 90
-      --access-logfile /dev/null --error-logfile -
+    startCommand: .venv/bin/python scripts/start_service.py
     healthCheckPath: /health
     disk:
       name: digest-private-state
@@ -24,6 +21,9 @@ services:
         value: 3.12.14
       - key: DIGEST_STATE_DIR
         value: /var/data
+      # Enable only after a delivered sample and final approval.
+      - key: DIGEST_SCHEDULE_ENABLED
+        value: "false"
       # Render provides RENDER_EXTERNAL_URL; the application uses it as its public URL.
       - key: DIGEST_ACTION_SECRET
         generateValue: true

@@ -1,4 +1,4 @@
-"""Read-only calendar diagnostics and local digest previews."""
+"""Calendar diagnostics, previews and explicit email delivery commands."""
 
 import argparse
 from dataclasses import asdict
@@ -22,6 +22,10 @@ from .preview import PreviewError, PreviewStage, create_preview, render_saved_pr
 from .selection import SelectionError
 from .action_links import issue_email
 from .action_store import StoreError
+from .calendar_operation_lock import CalendarLockError
+from .delivery import DeliveryError, delivery_status, prepare_delivery, submit_delivery
+from .smtp_delivery import MailSettings, SMTPDeliveryError, probe_smtp
+from .runtime import RuntimeConfigurationError, schedule_enabled
 
 
 def _preview_progress(stage: PreviewStage) -> None:
@@ -32,6 +36,7 @@ def _preview_progress(stage: PreviewStage) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Подключение календарей для дайджеста")
     commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("probe-smtp", help="Проверить вход на почтовый сервер без отправки письма")
     commands.add_parser("discover-icloud", help="Показать доступные календари iCloud")
     mailru = commands.add_parser("discover-mailru", help="Показать доступные календари Mail.ru")
     mailru.add_argument("--account", type=int, choices=(1, 2, 3), default=1,
@@ -49,7 +54,16 @@ def main(argv: list[str] | None = None) -> int:
     render.add_argument("--date", type=date.fromisoformat, metavar="YYYY-MM-DD", required=True)
     actions = commands.add_parser("issue-actions", help="Создать письмо со ссылками на размещённый сервис действий")
     actions.add_argument("--date", type=date.fromisoformat, metavar="YYYY-MM-DD", required=True)
-    for command in (preview, render, actions):
+    prepare = commands.add_parser("prepare-delivery", help="Подготовить полное письмо для доставки без отправки")
+    submit = commands.add_parser("send-ready", help="Отправить ранее подготовленное письмо один раз")
+    test = commands.add_parser("send-test", help="Собрать и отправить проверочное письмо получателю из настроек")
+    status = commands.add_parser("delivery-status", help="Показать результаты доставки без содержимого писем")
+    for command in (prepare, submit, test, status):
+        command.add_argument("--date", type=date.fromisoformat, metavar="YYYY-MM-DD",
+                             required=command in (prepare, submit))
+    for command in (prepare, submit):
+        command.add_argument("--kind", choices=("daily", "test"), default="daily")
+    for command in (preview, render, actions, prepare, submit, test, status):
         command.add_argument("--directory", type=Path,
                              default=Path(os.environ.get("DIGEST_STATE_DIR", ".local")),
                              help="Приватная папка данных (по умолчанию DIGEST_STATE_DIR или .local)")
@@ -63,7 +77,32 @@ def main(argv: list[str] | None = None) -> int:
         logging.getLogger(name).propagate = False
 
     try:
-        if args.command == "issue-actions":
+        if args.command == "probe-smtp":
+            result = probe_smtp(MailSettings.from_environment())
+        elif args.command == "delivery-status":
+            from .scheduler import scheduler_status
+
+            try:
+                result = delivery_status(args.directory, day=args.date)
+            except DeliveryError as error:
+                if not error.retryable:
+                    raise
+                result = {"deliveries": [], "busy": True}
+            result["schedule"] = {
+                "enabled": schedule_enabled(), **scheduler_status(args.directory),
+            }
+        elif args.command == "prepare-delivery":
+            result = prepare_delivery(args.date, args.directory, kind=args.kind)
+        elif args.command == "send-ready":
+            result = submit_delivery(args.date, args.directory, kind=args.kind)
+        elif args.command == "send-test":
+            day = args.date or (datetime.now(ZoneInfo("Europe/Moscow")).date() + timedelta(days=1))
+            print("Готовим проверочное письмо из актуальных календарей.", file=sys.stderr, flush=True)
+            result = prepare_delivery(day, args.directory, kind="test")
+            if result["state"] == "ready":
+                print("Передаём проверочное письмо почтовому серверу.", file=sys.stderr, flush=True)
+                result = submit_delivery(day, args.directory, kind="test")
+        elif args.command == "issue-actions":
             result = issue_email(args.date, args.directory)
         elif args.command == "render-preview":
             result = render_saved_preview(args.date, args.directory)
@@ -94,7 +133,8 @@ def main(argv: list[str] | None = None) -> int:
                 "window_end_exclusive": end.isoformat(),
                 "calendars": [asdict(c) for c in calendars],
             }
-    except (CalendarConnectionError, SelectionError, StateError, PreviewError, StoreError) as exc:
+    except (CalendarConnectionError, SelectionError, StateError, PreviewError, StoreError,
+            CalendarLockError, DeliveryError, SMTPDeliveryError, RuntimeConfigurationError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
     except Exception:
@@ -102,4 +142,6 @@ def main(argv: list[str] | None = None) -> int:
         print("Не удалось обработать ответ календаря; требуется диагностика адаптера.", file=sys.stderr)
         return 1
     print(json.dumps(result, ensure_ascii=False, indent=2))
+    if args.command in {"prepare-delivery", "send-ready", "send-test"}:
+        return 0 if result.get("state") in {"ready", "accepted"} else 1
     return 0
