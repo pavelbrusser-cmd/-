@@ -1,5 +1,6 @@
 """Owner-authenticated confirmation pages for single-use calendar actions."""
 
+from contextlib import ExitStack
 from datetime import date, datetime, timedelta
 from dataclasses import replace
 import hashlib
@@ -14,6 +15,7 @@ from flask import Flask, redirect, render_template_string, request, session
 from werkzeug.exceptions import HTTPException
 
 from .action_store import ActionStore, StoreError
+from .calendar_operation_lock import CalendarBusy, CalendarLockError, calendar_operation_lock
 from .event_actions import EventTarget, SafeActionError, ActionConflict, prepare_change, verify_change
 from .personal_cancellation import prepare_personal_cancellation, verify_personal_cancellation
 from .selection import MOSCOW
@@ -148,6 +150,7 @@ def create_app(config=None, backend=None):
     def action_page(token):
         claimed = False
         write_started = False
+        operations = ExitStack()
         try:
             # Signed, unexpired server-side target; never use IDs from form fields.
             record = store.read(token)
@@ -176,6 +179,7 @@ def create_app(config=None, backend=None):
                 return page(heading='Вход в календарь', login=True)
             if record['state'] != 'ready':
                 return terminal(record)
+            operations.enter_context(calendar_operation_lock(Path(app.config['STATE_DIR'])))
             target = EventTarget(**record['target'])
             version = calendar.read(target)
             if version.can_write is not True:
@@ -234,6 +238,15 @@ def create_app(config=None, backend=None):
                       'operation': change.operation}
             store.complete(token, result)
             return redirect(request.path, code=303)
+        except CalendarLockError as exc:
+            # The gate is acquired before calendar reads and token claims, so
+            # contention leaves every action available for a later retry.
+            response = app.make_response(page(
+                503, heading='Календари временно заняты' if isinstance(exc, CalendarBusy) else 'Сервис временно недоступен',
+                message=str(exc), error=True,
+            ))
+            response.headers['Retry-After'] = '30'
+            return response
         except (StoreError, SafeActionError, CalDAVActionError) as exc:
             uncertain = isinstance(exc, CalDAVUncertain) or (write_started and isinstance(exc, StoreError))
             message = ('Результат операции не удалось сохранить. Проверьте календарь перед новым действием.'
@@ -256,6 +269,8 @@ def create_app(config=None, backend=None):
                     pass
             return page(503, heading='Не удалось завершить действие',
                         message='Проверьте календарь перед повторной попыткой.' if claimed else 'Сервис временно недоступен. Попробуйте позже.', error=True)
+        finally:
+            operations.close()
 
     @app.errorhandler(HTTPException)
     def http_error(error):

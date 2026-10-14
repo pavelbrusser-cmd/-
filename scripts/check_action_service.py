@@ -4,6 +4,7 @@
 Run with .venv/bin/python. Test secrets are generated in memory and discarded.
 No public links are created; the internal listener stops before this exits.
 """
+import argparse
 import os
 from pathlib import Path
 import secrets
@@ -18,6 +19,9 @@ from calendar_digest.action_store import ActionStore
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--runtime', action='store_true', help='Exercise the Render supervisor with scheduling disabled')
+    args = parser.parse_args()
     root = Path(__file__).resolve().parent.parent
     with tempfile.TemporaryDirectory(prefix='digest-smoke-') as directory:
         key, password = secrets.token_urlsafe(48), secrets.token_urlsafe(32)
@@ -30,12 +34,16 @@ def main():
             listener.bind(('127.0.0.1', 0))
             port = listener.getsockname()[1]
         env = dict(os.environ, DIGEST_ACTION_SECRET=key, DIGEST_WEB_PASSWORD=password,
-                   DIGEST_STATE_DIR=directory)
-        process = subprocess.Popen([
+                   DIGEST_STATE_DIR=directory, DIGEST_SCHEDULE_ENABLED='false', PORT=str(port))
+        command = [
             str(root / '.venv/bin/gunicorn'), 'calendar_digest.action_web:create_app()',
             '--bind', f'127.0.0.1:{port}', '--workers', '1', '--threads', '4', '--timeout', '90',
             '--access-logfile', '/dev/null', '--error-logfile', '/dev/null',
-        ], cwd=root, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        ]
+        if args.runtime:
+            command = [str(root / '.venv/bin/python'), str(root / 'scripts/start_service.py')]
+        process = subprocess.Popen(command, cwd=root, env=env,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
             base = f'http://127.0.0.1:{port}'
             deadline = time.monotonic() + 15

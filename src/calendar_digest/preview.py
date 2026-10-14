@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 
 from .calendar_collection import collect_all
+from .calendar_operation_lock import calendar_operation_lock
 from .cancellation_archive import merge_cancellations
 from .local_state import advance_snapshot, read_snapshot, write_private, write_snapshot
 from .selection import DigestEvent, select_day
@@ -116,6 +117,17 @@ def render_markdown(events: list[DigestEvent], day: date, *, first_snapshot: boo
 def create_preview(
     day: date, directory: Path = Path(".local"), *,
     progress: Callable[[PreviewStage], None] | None = None,
+) -> dict:
+    # Share the web service's persistent gate even when preview files are saved
+    # elsewhere. Keep the output-directory lock for existing preview users.
+    state_directory = Path(os.environ.get("DIGEST_STATE_DIR") or directory)
+    with calendar_operation_lock(state_directory):
+        return _create_preview(day, directory, progress=progress)
+
+
+def _create_preview(
+    day: date, directory: Path, *,
+    progress: Callable[[PreviewStage], None] | None,
 ) -> dict:
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     lock_fd = os.open(directory / ".preview.lock", os.O_CREAT | os.O_RDWR, 0o600)
