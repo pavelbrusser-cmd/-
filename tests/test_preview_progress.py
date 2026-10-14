@@ -24,6 +24,10 @@ def collection():
 
 
 class PreviewProgressTests(unittest.TestCase):
+    def setUp(self):
+        # Keep runtime state paths and credentials out of the preview fixtures.
+        self.enterContext(patch.dict("os.environ", {}, clear=True))
+
     def test_fixed_stages_precede_work_and_completion_follows_saved_files(self):
         stages = []
         with tempfile.TemporaryDirectory() as temporary:
