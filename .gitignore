@@ -1,0 +1,16 @@
+# Python and local build outputs
+__pycache__/
+*.py[cod]
+.venv/
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Credentials and private calendar data stay outside version control.
+.env
+.env.*
+!.env.example
+.local/
+config.local.toml

@@ -18,10 +18,15 @@ from .mailru import (
 )
 from .readonly_caldav import CalendarConnectionError
 from .local_state import StateError
-from .preview import PreviewError, create_preview, render_saved_preview
+from .preview import PreviewError, PreviewStage, create_preview, render_saved_preview
 from .selection import SelectionError
 from .action_links import issue_email
 from .action_store import StoreError
+
+
+def _preview_progress(stage: PreviewStage) -> None:
+    if isinstance(stage, PreviewStage):
+        print(stage.value, file=sys.stderr, flush=True)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -64,7 +69,7 @@ def main(argv: list[str] | None = None) -> int:
             result = render_saved_preview(args.date, args.directory)
         elif args.command == "preview":
             day = args.date or (datetime.now(ZoneInfo("Europe/Moscow")).date() + timedelta(days=1))
-            result = create_preview(day, args.directory)
+            result = create_preview(day, args.directory, progress=_preview_progress)
         elif args.command == "discover-mailru":
             credentials = MailRuCredentials.from_environment(args.account)
             calendars = discover_mailru(credentials)

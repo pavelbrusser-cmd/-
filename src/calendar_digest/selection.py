@@ -5,9 +5,9 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
 import re
 from typing import Iterable, Protocol
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from icalendar import Calendar, Event
+from icalendar import Calendar, Event, vText
 from icalendar.parser import Contentlines
 import recurring_ical_events
 
@@ -68,6 +68,26 @@ class _Series:
     account_email: str
     uid: str
     components: dict[str | None, _Component] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class _PreviousMaster:
+    start: date | datetime
+    end: date | datetime
+    recurring: bool
+    assumed: bool
+
+
+class _UncachedSeries(recurring_ical_events.Series):
+    """Keep recurrence rules intact without caching every historical date."""
+
+    class RecurrenceRules(recurring_ical_events.Series.RecurrenceRules):
+        def rrulestr(self, text):
+            original = super().rrulestr(text)
+            rule = original.replace(cache=False)
+            rule.until = original.until
+            rule.string = getattr(original, "string", text)
+            return rule
 
 
 def _values(event, name):
@@ -218,7 +238,7 @@ def _revision(component):
     return sequence, _iso(value)
 
 
-def _read_series(resources):
+def _read_series(resources, *, only_key=None):
     result = {}
     for resource in resources:
         calendar = Calendar.from_ical(resource.data)
@@ -232,6 +252,8 @@ def _read_series(resources):
             component = _normalize(raw, duration_days=duration_days)
             uid = str(component.event["UID"])
             key = (resource.source_id, resource.calendar_id, uid)
+            if only_key is not None and key != only_key:
+                continue
             series = result.setdefault(key, _Series(
                 resource.source_id, resource.calendar_id, resource.calendar_name,
                 resource.account_email, uid,
@@ -245,6 +267,94 @@ def _read_series(resources):
                 or component.duration_days != previous.duration_days
             ):
                 raise SelectionError("Обнаружены противоречивые версии одного экземпляра события.")
+    return result
+
+
+def _resource_uids(data, *, timezones=None):
+    """Index raw resources without retaining parsed calendars for the archive."""
+    stack = []
+    uids = set()
+    event_uids = []
+    root_seen = False
+    for line in Contentlines.from_ical(data):
+        if not line:
+            continue
+        name, params, value = line.parts()
+        name = name.upper()
+        if timezones is not None and stack:
+            if stack[-1] == "VTIMEZONE" and name == "TZID":
+                timezones.add(str(vText.from_ical(value)))
+            elif stack[-1] == "VEVENT" and name in {"DTSTART", "DTEND", "RECURRENCE-ID", "RDATE", "EXDATE"} and params.get("TZID"):
+                timezones.add(str(params["TZID"]))
+        if name == "BEGIN":
+            kind = str(value).upper()
+            if not stack:
+                if root_seen or kind != "VCALENDAR":
+                    raise SelectionError("Не удалось разобрать календарь iCalendar.")
+                root_seen = True
+            stack.append(kind)
+            if kind == "VEVENT":
+                event_uids.append([])
+        elif name == "END":
+            if not stack or stack.pop() != str(value).upper():
+                raise SelectionError("Календарь содержит некорректную структуру событий.")
+            if str(value).upper() == "VEVENT":
+                values = event_uids.pop()
+                if len(values) != 1 or not values[0].strip():
+                    raise SelectionError("Событие содержит отсутствующее или неоднозначное обязательное поле.")
+                uids.add(values[0])
+        elif stack and stack[-1] == "VEVENT" and name == "UID":
+            event_uids[-1].append(str(vText.from_ical(value)))
+    if stack or not root_seen:
+        raise SelectionError("Календарь содержит некорректную структуру событий.")
+    return uids
+
+
+def _group_resources(resources):
+    groups = {}
+    checked_timezones = set()
+    for resource in resources:
+        timezones = set()
+        uids = _resource_uids(resource.data, timezones=timezones)
+        custom_zone = False
+        for identifier in timezones - checked_timezones:
+            try:
+                ZoneInfo(identifier)
+            except (ZoneInfoNotFoundError, ValueError):
+                custom_zone = True
+        if not uids or custom_zone:
+            # Retain the full parser's validation for resources with no VEVENT.
+            # Unknown custom TZIDs must also be registered/validated in the
+            # original current-resource order, before parsing old snapshots.
+            # icalendar caches custom TZIDs by their first observed definition.
+            _read_series([resource])
+        checked_timezones.update(timezones)
+        for uid in uids:
+            key = (resource.source_id, resource.calendar_id, uid)
+            groups.setdefault(key, []).append(resource)
+    return groups
+
+
+def _iter_grouped_series(groups):
+    """Parse only one UID group at a time, including separately stored overrides."""
+    for key, group in groups.items():
+        parsed = _read_series(group, only_key=key)
+        if key not in parsed:
+            raise SelectionError("Не удалось однозначно определить идентификатор события.")
+        yield key, parsed[key]
+
+
+def _iter_series(resources):
+    yield from _iter_grouped_series(_group_resources(resources))
+
+
+def _previous_masters(resources):
+    """History needs intervals, not a second complete iCalendar object graph."""
+    result = {}
+    for key, series in _iter_series(resources):
+        master = series.components.get(None)
+        if master is not None:
+            result[key] = _PreviousMaster(master.start, master.end, _is_recurring(master), master.assumed)
     return result
 
 
@@ -349,22 +459,22 @@ def select_day(
             raise SelectionError("Для дайджеста нужна календарная дата без времени.")
         day_start = datetime.combine(day, time.min, MOSCOW)
         day_end = day_start + timedelta(days=1)
-        current = _read_series(resources)
-        previous = _read_series(previous_resources) if previous_resources is not None else {}
+        current_groups = _group_resources(resources)
+        previous = _previous_masters(previous_resources) if previous_resources is not None else {}
         selected = []
-        for key, series in current.items():
+        for key, series in _iter_grouped_series(current_groups):
             master = series.components.get(None)
-            old_series = previous.get(key)
-            old_master = old_series.components.get(None) if old_series is not None else None
+            old_master = previous.get(key)
             recurring = _is_recurring(master) or any(rid is not None for rid in series.components)
             if master is not None and old_master is not None:
-                if (_is_recurring(master) or _is_recurring(old_master)) and _iso(master.start) != _iso(old_master.start):
+                if (_is_recurring(master) or old_master.recurring) and _iso(master.start) != _iso(old_master.start):
                     raise SelectionError("Сравнение переноса начала всей повторяющейся серии пока не поддерживается.")
             if master is not None and _is_recurring(master):
                 calendar = Calendar()
                 calendar.add_component(deepcopy(master.event))
                 query = recurring_ical_events.of(
                     calendar, keep_recurrence_attributes=True, skip_bad_series=False,
+                    components=(recurring_ical_events.ComponentsWithName("VEVENT", series=_UncachedSeries),),
                 )
                 occurrences = query.between(day_start, day_end)
                 # The library's lookback accounts for the master's duration,
@@ -389,7 +499,7 @@ def select_day(
                     if _overlaps(occurrence.start, occurrence.end, day_start, day_end):
                         selected.append(_digest(series, occurrence, recurring=True))
             elif master is not None:
-                moved = old_master is not None and not _is_recurring(old_master) and _iso(master.start) != _iso(old_master.start)
+                moved = old_master is not None and not old_master.recurring and _iso(master.start) != _iso(old_master.start)
                 if _overlaps(master.start, master.end, day_start, day_end) or (
                     moved and _overlaps(old_master.start, old_master.end, day_start, day_end)
                 ):

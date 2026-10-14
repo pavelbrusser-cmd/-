@@ -1,8 +1,10 @@
 """Local digest preview. No email transport or scheduler is invoked here."""
 
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import asdict
 from datetime import date, datetime, timedelta
+from enum import Enum
 import fcntl
 from html import escape
 import json
@@ -10,13 +12,35 @@ import os
 from pathlib import Path
 
 from .calendar_collection import collect_all
-from .local_state import advance_snapshot, read_snapshot, snapshot_json, write_private
+from .local_state import advance_snapshot, read_snapshot, write_private, write_snapshot
 from .selection import DigestEvent, select_day
 from .email_html import render_email_html
 
 
 class PreviewError(Exception):
     pass
+
+
+class PreviewStage(Enum):
+    """Fixed progress messages, containing no calendar or account data."""
+
+    READ_STATE = "Читаем сохранённое состояние."
+    COLLECT = "Читаем события календарей. Это может занять несколько минут."
+    COMPARE = "Сравниваем события с предыдущим состоянием."
+    SELECT = "Отбираем события и разворачиваем повторения."
+    RENDER = "Формируем дайджест."
+    SAVE = "Сохраняем дайджест и состояние."
+    DONE = "Дайджест сохранён."
+
+
+def _report_progress(progress: Callable[[PreviewStage], None] | None, stage: PreviewStage) -> None:
+    if progress is None:
+        return
+    try:
+        progress(stage)
+    except Exception:
+        # An observer must not interrupt collection or expose its own exception.
+        pass
 
 
 def _text(value: str) -> str:
@@ -88,7 +112,10 @@ def render_markdown(events: list[DigestEvent], day: date, *, first_snapshot: boo
     return "\n".join(lines)
 
 
-def create_preview(day: date, directory: Path = Path(".local")) -> dict:
+def create_preview(
+    day: date, directory: Path = Path(".local"), *,
+    progress: Callable[[PreviewStage], None] | None = None,
+) -> dict:
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     lock_fd = os.open(directory / ".preview.lock", os.O_CREAT | os.O_RDWR, 0o600)
     with os.fdopen(lock_fd, "a") as lock:
@@ -96,11 +123,16 @@ def create_preview(day: date, directory: Path = Path(".local")) -> dict:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise PreviewError("Сбор календарей уже выполняется; дождитесь его завершения.") from None
+        _report_progress(progress, PreviewStage.READ_STATE)
         old = read_snapshot(directory / "calendar-state.json")
+        _report_progress(progress, PreviewStage.COLLECT)
         collection = collect_all()
+        _report_progress(progress, PreviewStage.COMPARE)
         snapshot = advance_snapshot(collection.resources, old)
         first_snapshot = not old.current
+        _report_progress(progress, PreviewStage.SELECT)
         events = select_day(collection.resources, day, previous_resources=snapshot.previous)
+        _report_progress(progress, PreviewStage.RENDER)
         markdown = render_markdown(events, day, first_snapshot=first_snapshot)
         email_html = render_email_html(events, day, first_snapshot=first_snapshot)
         interactive_html = render_email_html(events, day, interactive=True, first_snapshot=first_snapshot)
@@ -108,17 +140,18 @@ def create_preview(day: date, directory: Path = Path(".local")) -> dict:
             "date": day.isoformat(), "timezone": "Europe/Moscow", "first_snapshot": first_snapshot,
             "events": [asdict(event) for event in events],
         }
+        _report_progress(progress, PreviewStage.SAVE)
         markdown_path = directory / f"preview-{day.isoformat()}.md"
         json_path = directory / f"preview-{day.isoformat()}.json"
         payload_text = json.dumps(payload, ensure_ascii=False, indent=2)
-        snapshot_text = snapshot_json(snapshot)
         # Fetch/selection must succeed for every source before any output changes.
         write_private(markdown_path, markdown)
         write_private(json_path, payload_text)
         write_private(directory / f"email-{day.isoformat()}.html", email_html)
         write_private(directory / f"preview-{day.isoformat()}.html", interactive_html)
         # Commit the baseline last, so failed collection/rendering cannot consume a change.
-        write_private(directory / "calendar-state.json", snapshot_text)
+        write_snapshot(directory / "calendar-state.json", snapshot)
+        _report_progress(progress, PreviewStage.DONE)
         return {
             "date": day.isoformat(), "timezone": "Europe/Moscow",
             "calendars": collection.calendar_count, "resources": len(collection.resources),
