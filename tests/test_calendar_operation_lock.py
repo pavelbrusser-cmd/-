@@ -7,6 +7,7 @@ import errno
 import os
 from pathlib import Path
 import select
+import stat
 import subprocess
 import sys
 import tempfile
@@ -71,16 +72,47 @@ def child_lock(directory):
 
 
 class CalendarOperationLockTests(unittest.TestCase):
+    def test_writable_managed_directory_does_not_require_permission_to_chmod_it(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary) / 'managed-volume'
+            directory.mkdir()
+            directory.chmod(0o2775)
+            original_mode = stat.S_IMODE(directory.stat().st_mode)
+            original_fchmod = os.fchmod
+
+            def file_chmod_only(descriptor, mode):
+                if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                    raise PermissionError(errno.EPERM, 'managed directory belongs to provider')
+                return original_fchmod(descriptor, mode)
+
+            with patch.object(locks.os, 'fchmod', side_effect=file_chmod_only):
+                with locks.calendar_operation_lock(directory):
+                    self.assertEqual(stat.S_IMODE(directory.stat().st_mode), original_mode)
+                    self.assertEqual(child_probe(directory), 'busy')
+                    lock_file = directory / '.calendar-operation.lock'
+                    self.assertEqual(stat.S_IMODE(lock_file.stat().st_mode), 0o600)
+            self.assertEqual(child_probe(directory), 'acquired')
+            self.assertEqual(stat.S_IMODE(directory.stat().st_mode), original_mode)
+
+    def test_new_state_directory_is_created_private(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary) / 'new-state'
+            with locks.calendar_operation_lock(directory):
+                self.assertEqual(stat.S_IMODE(directory.stat().st_mode), 0o700)
+                self.assertEqual(stat.S_IMODE((directory / '.calendar-operation.lock').stat().st_mode), 0o600)
+
     def test_cross_process_gate_is_nonblocking_private_and_keeps_one_inode(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary) / 'state'
             directory.mkdir(mode=0o755)
+            directory.chmod(0o755)
             lock_file = directory / '.calendar-operation.lock'
             lock_file.touch(mode=0o644)
+            lock_file.chmod(0o644)
             inode = lock_file.stat().st_ino
             with locks.calendar_operation_lock(directory):
                 self.assertEqual(child_probe(directory), 'busy')
-                self.assertEqual(directory.stat().st_mode & 0o777, 0o700)
+                self.assertEqual(directory.stat().st_mode & 0o777, 0o755)
                 self.assertEqual(lock_file.stat().st_mode & 0o777, 0o600)
             self.assertEqual(child_probe(directory), 'acquired')
             self.assertEqual(lock_file.stat().st_ino, inode)
@@ -117,8 +149,8 @@ class CalendarOperationLockTests(unittest.TestCase):
                 with self.assertRaises(locks.CalendarLockError) as error:
                     with locks.calendar_operation_lock(directory):
                         self.fail('Broken storage entered')
-                self.assertEqual(opened.call_count, 1)
-                self.assertEqual(closed.call_count, 1)
+                self.assertEqual(opened.call_count, 2)
+                self.assertEqual(closed.call_count, 2)
                 self.assertNotIn('private-path', str(error.exception))
                 self.assertNotIn(temporary, str(error.exception))
 

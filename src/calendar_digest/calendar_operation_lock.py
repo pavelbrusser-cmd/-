@@ -34,7 +34,9 @@ def calendar_operation_lock(directory: Path):
             directory_fd = os.open(
                 directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
             )
-            os.fchmod(directory_fd, 0o700)
+            # A writable managed-volume root can belong to the hosting provider.
+            # Preserve its permissions; mkdir protects new directories and the
+            # application-owned lock file is secured below.
             lock_fd = os.open(
                 '.calendar-operation.lock',
                 os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC,
