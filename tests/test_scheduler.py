@@ -183,6 +183,40 @@ class SchedulerProcessTests(unittest.TestCase):
             scheduler.serve(Path(temporary), stop=stop, clock=lambda: now)
         self.assertEqual(run.call_count, 1)
 
+    def test_calendar_busy_retries_after_thirty_seconds_other_failures_after_five_minutes(self):
+        for first_code, delay in ((75, timedelta(seconds=30)), (1, timedelta(minutes=5))):
+            with self.subTest(first_code=first_code):
+                stop = Mock()
+                stop.is_set.return_value = False
+                now = moment("16:55")
+                started = []
+
+                def wait(seconds):
+                    nonlocal now
+                    self.assertGreater(seconds, 0)
+                    now += timedelta(seconds=seconds)
+
+                stop.wait.side_effect = wait
+
+                def job(command, **kwargs):
+                    self.assertEqual(command, "prepare-delivery")
+                    started.append(now)
+                    if len(started) == 1:
+                        return first_code
+                    stop.is_set.return_value = True
+                    return 0
+
+                with tempfile.TemporaryDirectory() as temporary, \
+                        patch.object(scheduler, "_daily_status", return_value=None), \
+                        patch.object(scheduler, "run_job", side_effect=job), \
+                        redirect_stdout(StringIO()), redirect_stderr(StringIO()) as stderr:
+                    scheduler.serve(Path(temporary), stop=stop, clock=lambda: now)
+                self.assertEqual(started, [moment("16:55"), moment("16:55") + delay])
+                if first_code == 75:
+                    self.assertIn("30 секунд", stderr.getvalue())
+                else:
+                    self.assertNotIn("30 секунд", stderr.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

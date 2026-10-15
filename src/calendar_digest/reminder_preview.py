@@ -17,8 +17,10 @@ from zoneinfo import ZoneInfo
 
 from .calendar_collection import collect_all
 from .calendar_operation_lock import calendar_operation_lock
+from .contact_birthdays import contact_birthdays_enabled, plan_contact_birthdays
+from .contact_birthdays_source import BirthdayCollection, collect_contact_birthdays
 from .local_state import write_private
-from .reminders import Reminder, plan_reminders
+from .reminders import Reminder, combine_reminder_plans, plan_reminders
 
 
 MOSCOW = ZoneInfo("Europe/Moscow")
@@ -33,6 +35,7 @@ RULE_LABELS = {
     "h3": "За 3 часа", "h1": "За 1 час",
 }
 SOURCE_LABELS = {
+    "icloud_contacts": "Контакты iCloud",
     "icloud": "iCloud", "mailru_1": "Mail.ru · аккаунт 1",
     "mailru_2": "Mail.ru · аккаунт 2", "mailru_3": "Mail.ru · аккаунт 3",
 }
@@ -46,6 +49,7 @@ class ReminderPreviewError(Exception):
 
 
 class ReminderPreviewStage(Enum):
+    CONTACTS = "Читаем дни рождения из iCloud Contacts."
     COLLECT = "Читаем события календарей. Это может занять несколько минут."
     PLAN = "Рассчитываем время уведомлений по согласованным правилам."
     RENDER = "Формируем предпросмотр уведомлений."
@@ -188,6 +192,7 @@ def create_reminder_preview(
 ) -> dict:
     """Collect once, calculate a notification window, save private preview files."""
     window_start, window_end = _window(start, days, control_source)
+    use_contacts = contact_birthdays_enabled()
     directory = Path(directory)
     state_directory = Path(os.environ.get("DIGEST_STATE_DIR") or directory)
     with calendar_operation_lock(state_directory):
@@ -197,6 +202,10 @@ def create_reminder_preview(
             directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         except OSError:
             raise ReminderPreviewError("Не удалось открыть защищённый каталог предпросмотра.") from None
+        birthdays = BirthdayCollection([], 0)
+        if use_contacts:
+            _report(progress, ReminderPreviewStage.CONTACTS)
+            birthdays = collect_contact_birthdays()
         _report(progress, ReminderPreviewStage.COLLECT)
         collection = collect_all()
         _report(progress, ReminderPreviewStage.PLAN)
@@ -204,6 +213,10 @@ def create_reminder_preview(
             collection.resources, window_start=window_start, window_end=window_end,
             control_source=control_source,
         )
+        if use_contacts:
+            plan = combine_reminder_plans(plan, plan_contact_birthdays(
+                birthdays.contacts, window_start=window_start, window_end=window_end,
+            ))
         generated_at = datetime.now(MOSCOW)
         _report(progress, ReminderPreviewStage.RENDER)
         html = render_reminder_preview(plan.reminders, start, days=days, generated_at=generated_at)
@@ -211,6 +224,8 @@ def create_reminder_preview(
             "start_date": start.isoformat(), "end_date_exclusive": window_end.date().isoformat(),
             "days": days, "timezone": "Europe/Moscow", "generated_at": generated_at.isoformat(),
             "calendars": collection.calendar_count, "resources": len(collection.resources),
+            "contacts_enabled": use_contacts, "birthday_contacts": len(birthdays.contacts),
+            "contact_addressbooks": birthdays.addressbooks,
             "sent": False,
         }
         payload = {

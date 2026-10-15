@@ -22,13 +22,16 @@ from .preview import PreviewError, PreviewStage, create_preview, render_saved_pr
 from .selection import SelectionError
 from .action_links import issue_email
 from .action_store import StoreError
-from .calendar_operation_lock import CalendarLockError
+from .calendar_operation_lock import CalendarBusy, CalendarLockError
+from .contact_birthdays_source import collect_contact_birthdays
 from .delivery import DeliveryError, delivery_status, prepare_delivery, submit_delivery
 from .smtp_delivery import MailSettings, SMTPDeliveryError, probe_smtp
 from .runtime import RuntimeConfigurationError, schedule_enabled
 from .reminder_preview import ReminderPreviewError, ReminderPreviewStage, create_reminder_preview
 from .push_transport import PushError, PushoverSettings, probe_pushover
 from .push_delivery import PushDeliveryError, push_status, send_push_test
+from .push_automation import PushCycleError, automatic_push_status, prepare_push, run_push_cycle
+from .push_queue import QueueError
 
 
 def _preview_progress(stage: PreviewStage) -> None:
@@ -46,6 +49,7 @@ def main(argv: list[str] | None = None) -> int:
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("probe-smtp", help="Проверить вход на почтовый сервер без отправки письма")
     commands.add_parser("probe-push", help="Проверить настройки Pushover без отправки уведомления")
+    commands.add_parser("probe-birthdays", help="Проверить чтение дней рождения iCloud Contacts без вывода имён")
     reminder_preview = commands.add_parser("preview-reminders", help="Показать расписание уведомлений без отправки")
     reminder_preview.add_argument("--date", type=date.fromisoformat, metavar="YYYY-MM-DD",
                                   help="Первый день уведомлений по Москве (по умолчанию сегодня)")
@@ -53,7 +57,9 @@ def main(argv: list[str] | None = None) -> int:
     reminder_preview.add_argument("--control-source", choices=("mailru_1", "mailru_2", "mailru_3"),
                                   default="mailru_2", help="Аккаунт контрольных событий (по умолчанию mailru_2)")
     push_test = commands.add_parser("send-push-test", help="Отправить одно проверочное уведомление на настроенный iPhone")
-    push_receipts = commands.add_parser("push-status", help="Показать результаты проверочной push-доставки")
+    push_receipts = commands.add_parser("push-status", help="Показать проверочную доставку и состояние автоматических уведомлений")
+    push_prepare = commands.add_parser("prepare-push", help="Обновить календари и очередь уведомлений без отправки")
+    push_cycle = commands.add_parser("push-cycle", help="Выполнить один цикл включённого расписания push")
     commands.add_parser("discover-icloud", help="Показать доступные календари iCloud")
     mailru = commands.add_parser("discover-mailru", help="Показать доступные календари Mail.ru")
     mailru.add_argument("--account", type=int, choices=(1, 2, 3), default=1,
@@ -81,7 +87,7 @@ def main(argv: list[str] | None = None) -> int:
     for command in (prepare, submit):
         command.add_argument("--kind", choices=("daily", "test"), default="daily")
     for command in (preview, render, actions, prepare, submit, test, status,
-                    reminder_preview, push_test, push_receipts):
+                    reminder_preview, push_test, push_receipts, push_prepare, push_cycle):
         command.add_argument("--directory", type=Path,
                              default=Path(os.environ.get("DIGEST_STATE_DIR", ".local")),
                              help="Приватная папка данных (по умолчанию DIGEST_STATE_DIR или .local)")
@@ -99,6 +105,10 @@ def main(argv: list[str] | None = None) -> int:
             result = probe_smtp(MailSettings.from_environment())
         elif args.command == "probe-push":
             result = probe_pushover(PushoverSettings.from_environment())
+        elif args.command == "probe-birthdays":
+            birthdays = collect_contact_birthdays()
+            result = {"icloud_contacts": "ok", "addressbooks": birthdays.addressbooks,
+                      "birthdays": len(birthdays.contacts), "sent": False}
         elif args.command == "preview-reminders":
             start = args.date or datetime.now(ZoneInfo("Europe/Moscow")).date()
             result = create_reminder_preview(start, args.directory, days=args.days,
@@ -107,6 +117,12 @@ def main(argv: list[str] | None = None) -> int:
             result = send_push_test(args.directory)
         elif args.command == "push-status":
             result = push_status(args.directory)
+            result["automatic"] = automatic_push_status(args.directory)
+        elif args.command == "prepare-push":
+            print("Обновляем календари и готовим очередь. Уведомления не отправляются.", file=sys.stderr, flush=True)
+            result = prepare_push(args.directory)
+        elif args.command == "push-cycle":
+            result = run_push_cycle(args.directory)
         elif args.command == "delivery-status":
             from .scheduler import scheduler_status
 
@@ -161,9 +177,12 @@ def main(argv: list[str] | None = None) -> int:
                 "window_end_exclusive": end.isoformat(),
                 "calendars": [asdict(c) for c in calendars],
             }
+    except CalendarBusy as exc:
+        print(str(exc), file=sys.stderr)
+        return 75
     except (CalendarConnectionError, SelectionError, StateError, PreviewError, StoreError,
             CalendarLockError, DeliveryError, SMTPDeliveryError, RuntimeConfigurationError,
-            ReminderPreviewError, PushError, PushDeliveryError) as exc:
+            ReminderPreviewError, PushError, PushDeliveryError, PushCycleError, QueueError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
     except Exception:
@@ -175,4 +194,6 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if result.get("state") in {"ready", "accepted"} else 1
     if args.command == "send-push-test":
         return 0 if result.get("state") == "accepted" else 1
+    if args.command == "push-cycle":
+        return 1 if result.get("failed") or result.get("uncertain") else 0
     return 0

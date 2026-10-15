@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 from calendar_digest.calendar_collection import CalendarResource, Collection
 from calendar_digest.calendar_operation_lock import CalendarBusy, calendar_operation_lock
+from calendar_digest.contact_birthdays_source import BirthdayCollection, ContactBirthday
 from calendar_digest import reminder_preview as preview
 from calendar_digest.reminder_preview import (
     ReminderPreviewError, ReminderPreviewStage, create_reminder_preview,
@@ -84,6 +85,42 @@ class ReminderPreviewTests(unittest.TestCase):
         serialized = json.dumps(result, ensure_ascii=False)
         for private in ("birthday-uid", "private-calendar-id", "Ночное поручение", "Личные даты", "private-login"):
             self.assertNotIn(private, serialized)
+
+    def test_optional_contact_birthdays_join_calendar_preview_without_exposing_names_in_summary(self):
+        os.environ['ICLOUD_CONTACT_BIRTHDAYS_ENABLED'] = 'true'
+        birthdays = BirthdayCollection([ContactBirthday('private-book', 'contact-uid', 'Private contact <x>', 10, 20)], 1)
+        stages = []
+        with patch.object(preview, 'collect_contact_birthdays', return_value=birthdays) as collect:
+            result = self.run_preview(progress=stages.append)
+        collect.assert_called_once_with()
+        self.assertEqual(stages, list(ReminderPreviewStage))
+        self.assertTrue(result['contacts_enabled'])
+        self.assertEqual(result['birthday_contacts'], 1)
+        self.assertEqual(result['contact_addressbooks'], 1)
+        self.assertEqual(result['by_category']['birthdays'], 6)
+        self.assertEqual(result['reminders_total'], 10)
+        html = Path(result['preview_html']).read_text()
+        self.assertIn('Private contact &lt;x&gt;', html)
+        self.assertIn('Контакты iCloud', html)
+        self.assertNotIn('Private contact', json.dumps(result))
+        payload = json.loads(Path(result['preview_json']).read_text())
+        notices = [item for item in payload['reminders'] if item['source_id'] == 'icloud_contacts']
+        self.assertEqual([item['notify_at'] for item in notices], [
+            '2026-10-17T09:00:00+03:00', '2026-10-19T09:00:00+03:00', '2026-10-20T09:00:00+03:00'])
+
+    def test_contacts_are_not_read_unless_enabled_and_failure_never_overwrites_preview(self):
+        with patch.object(preview, 'collect_contact_birthdays') as collect:
+            result = self.run_preview()
+        collect.assert_not_called()
+        self.assertFalse(result['contacts_enabled'])
+        original = Path(result['preview_json']).read_bytes()
+        os.environ['ICLOUD_CONTACT_BIRTHDAYS_ENABLED'] = 'true'
+        with patch.object(preview, 'collect_contact_birthdays', side_effect=CalendarConnectionError('safe failure')), \
+                patch.object(preview, 'collect_all') as calendars:
+            with self.assertRaises(CalendarConnectionError):
+                create_reminder_preview(date(2026, 10, 15), self.directory)
+        calendars.assert_not_called()
+        self.assertEqual(Path(result['preview_json']).read_bytes(), original)
 
     def test_html_escapes_calendar_content_and_has_no_links_scripts_or_remote_assets(self):
         dangerous = '<img src="https://invalid.example/pixel" onerror="alert(1)"> & <script>oops</script>'
@@ -225,7 +262,7 @@ class ReminderPreviewTests(unittest.TestCase):
                 self.assertTrue((self.directory / "reminder-preview-2026-10-15.html").is_file())
 
         self.run_preview(progress=observer)
-        self.assertEqual(stages, list(ReminderPreviewStage))
+        self.assertEqual(stages, [stage for stage in ReminderPreviewStage if stage is not ReminderPreviewStage.CONTACTS])
         self.assertNotIn("private", " ".join(stage.value for stage in stages).lower())
 
     def test_observer_failure_is_ignored_without_printing_private_error(self):
@@ -239,7 +276,7 @@ class ReminderPreviewTests(unittest.TestCase):
         with redirect_stdout(stdout), redirect_stderr(stderr):
             result = self.run_preview(progress=observer)
         self.assertEqual(result["reminders_total"], 7)
-        self.assertEqual(attempted, list(ReminderPreviewStage))
+        self.assertEqual(attempted, [stage for stage in ReminderPreviewStage if stage is not ReminderPreviewStage.CONTACTS])
         self.assertEqual(stdout.getvalue(), "")
         self.assertEqual(stderr.getvalue(), "")
 

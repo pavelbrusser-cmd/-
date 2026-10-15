@@ -38,11 +38,21 @@ class PresentationTests(unittest.TestCase):
         self.assertEqual(CATEGORY_LABELS["birthdays"], "Дни рождения")
         self.assertEqual(CATEGORY_LABELS["all_day"], "На весь день")
 
+    def test_possessive_birthday_with_complete_numeric_ordinal(self):
+        for apostrophe in ("'", "’"):
+            for ordinal in ("1st", "2nd", "3rd", "11th", "12th", "13th", "21st", "22nd", "23rd", "46th"):
+                title = f"Example Person{apostrophe}s {ordinal} Birthday"
+                with self.subTest(title=title):
+                    self.assertEqual(classify_event(sample(title=title)), "birthdays")
+
     def test_neutral_titles_do_not_imply_birthday_holiday_or_meeting(self):
         for title in (
             "Учебное событие", "ДР — служебное сокращение",
             "Подготовить подарок ко дню рождения", "Новый год — подготовка отчёта",
             "Meetinghouse maintenance", "Подготовить материалы для встречи",
+            "Example Person’s 46t...", "Example Person’s 46th", "Example Person 46th",
+            "46th", "Example Person’s 46th birthdayish", "Example Person’s 46th meeting",
+            "Example Person’s 46t birthday", "Example Person’s 46 birthday",
         ):
             with self.subTest(title=title):
                 self.assertEqual(classify_event(sample(title=title)), "events")
