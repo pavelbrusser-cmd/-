@@ -1,8 +1,9 @@
 """Supervise the web service and its optional, separate scheduling process.
 
-Neither importing this module nor running with the schedule disabled reads SMTP
-credentials or starts a mail job. Process groups let the supervisor stop a
-calendar collection even when the scheduling process itself has died.
+Neither importing this module nor running with schedules disabled reads delivery
+credentials or starts a job. Push settings are validated inside its isolated
+jobs, so a missing push key does not stop web or email. Process groups let the
+supervisor stop collection even when a scheduling process itself has died.
 """
 
 import os
@@ -27,6 +28,14 @@ def schedule_enabled(environment: Mapping[str, str] | None = None) -> bool:
     return value == "true"
 
 
+def push_schedule_enabled(environment: Mapping[str, str] | None = None) -> bool:
+    environment = os.environ if environment is None else environment
+    value = environment.get("PUSH_SCHEDULE_ENABLED", "false")
+    if value not in {"true", "false"}:
+        raise RuntimeConfigurationError("PUSH_SCHEDULE_ENABLED должен быть true или false.")
+    return value == "true"
+
+
 def service_port(environment: Mapping[str, str] | None = None) -> int:
     environment = os.environ if environment is None else environment
     value = environment.get("PORT", "10000")
@@ -46,7 +55,8 @@ def validate_smtp_settings():
     MailSettings.from_environment()
 
 
-def service_commands(root: Path, *, port: int, enabled: bool) -> list[list[str]]:
+def service_commands(root: Path, *, port: int, enabled: bool,
+                     push_enabled: bool = False) -> list[list[str]]:
     commands = [[
         str(root / ".venv/bin/gunicorn"), "calendar_digest.action_web:create_app()",
         "--bind", f"0.0.0.0:{port}", "--workers", "1", "--threads", "4",
@@ -54,6 +64,8 @@ def service_commands(root: Path, *, port: int, enabled: bool) -> list[list[str]]
     ]]
     if enabled:
         commands.append([sys.executable, "-m", "calendar_digest.scheduler"])
+    if push_enabled:
+        commands.append([sys.executable, "-m", "calendar_digest.push_scheduler"])
     return commands
 
 
@@ -105,6 +117,7 @@ def supervise(commands: list[list[str]], *, root: Path, stop: threading.Event) -
 def main() -> int:
     try:
         enabled = schedule_enabled()
+        push_enabled = push_schedule_enabled()
         port = service_port()
         if enabled:
             validate_smtp_settings()
@@ -124,7 +137,9 @@ def main() -> int:
     try:
         root = Path(__file__).resolve().parents[2]
         print("Расписание включено." if enabled else "Расписание выключено.", flush=True)
-        return supervise(service_commands(root, port=port, enabled=enabled), root=root, stop=stop)
+        print("Push-расписание включено." if push_enabled else "Push-расписание выключено.", flush=True)
+        return supervise(service_commands(root, port=port, enabled=enabled,
+                                           push_enabled=push_enabled), root=root, stop=stop)
     finally:
         for signum, handler in old_handlers.items():
             signal.signal(signum, handler)

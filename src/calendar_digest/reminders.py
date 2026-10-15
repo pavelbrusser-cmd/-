@@ -68,6 +68,27 @@ class ReminderPlan:
     summary: dict
 
 
+def combine_reminder_plans(*plans: ReminderPlan) -> ReminderPlan:
+    """Combine distinct sources without guessing that equal names mean one person."""
+    summary = {}
+    reminders = {}
+    for plan in plans:
+        for key, value in plan.summary.items():
+            if isinstance(value, dict):
+                counts = summary.setdefault(key, {})
+                for name, count in value.items():
+                    counts[name] = counts.get(name, 0) + count
+            else:
+                summary[key] = summary.get(key, 0) + value
+        for reminder in plan.reminders:
+            if reminder.stable_id in reminders:
+                raise ReminderError("Повторная идентичность напоминания при объединении источников.")
+            reminders[reminder.stable_id] = reminder
+            if len(reminders) > MAX_REMINDERS:
+                raise ReminderError("Слишком много напоминаний; план не сформирован.")
+    return ReminderPlan(sorted(reminders.values(), key=lambda item: (item.notify_at, item.stable_id)), summary)
+
+
 class _Budget:
     def __init__(self):
         self.total = 0

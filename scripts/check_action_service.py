@@ -34,7 +34,8 @@ def main():
             listener.bind(('127.0.0.1', 0))
             port = listener.getsockname()[1]
         env = dict(os.environ, DIGEST_ACTION_SECRET=key, DIGEST_WEB_PASSWORD=password,
-                   DIGEST_STATE_DIR=directory, DIGEST_SCHEDULE_ENABLED='false', PORT=str(port))
+                   DIGEST_STATE_DIR=directory, DIGEST_SCHEDULE_ENABLED='false',
+                   PUSH_SCHEDULE_ENABLED='false', PORT=str(port))
         command = [
             str(root / '.venv/bin/gunicorn'), 'calendar_digest.action_web:create_app()',
             '--bind', f'127.0.0.1:{port}', '--workers', '1', '--threads', '4', '--timeout', '90',

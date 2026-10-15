@@ -25,6 +25,8 @@ PREPARE_TIME = day_time(16, 55)
 SEND_TIME = day_time(17)
 CUTOFF_TIME = day_time(17, 30)
 RETRY_DELAY = timedelta(minutes=5)
+BUSY_RETRY_DELAY = timedelta(seconds=30)
+TEMPORARY_BUSY_EXIT_CODE = 75
 MAX_JOB_SECONDS = 15 * 60
 HEARTBEAT_NAME = "schedule-status.json"
 
@@ -228,7 +230,14 @@ def serve(directory: Path, *, stop: threading.Event, clock=_now):
                                    heartbeat=lambda: write_heartbeat(directory, activity=activity, now=clock()))
                 except OSError:
                     code = 1
-                if code != 0:
+                if code == TEMPORARY_BUSY_EXIT_CODE:
+                    # Another calendar job may be holding the shared lock.
+                    # Poll promptly so a short push sync near 16:55 does not
+                    # postpone preparation by the full network-error interval.
+                    retry_after = clock() + BUSY_RETRY_DELAY
+                    print("Календари заняты другой задачей. Повтор проверки через 30 секунд.",
+                          file=sys.stderr, flush=True)
+                elif code != 0:
                     retry_after = clock() + RETRY_DELAY
                     print("Задача завершилась без подтверждения успеха. Перед повтором проверим журнал отправок.",
                           file=sys.stderr, flush=True)

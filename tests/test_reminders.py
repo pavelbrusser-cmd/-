@@ -34,6 +34,15 @@ def plan(resources, start="2026-10-10T00:00:00+03:00", end="2026-10-20T00:00:00+
 
 
 class ReminderTests(unittest.TestCase):
+    def test_combining_sources_keeps_namesakes_and_rejects_duplicate_identities(self):
+        first = plan([resource(event('one', 'DTSTART;VALUE=DATE:20261015', 'SUMMARY:Birthday Person'), source='icloud')])
+        second = plan([resource(event('two', 'DTSTART;VALUE=DATE:20261015', 'SUMMARY:Birthday Person'), source='mailru_1')])
+        combined = reminders.combine_reminder_plans(first, second)
+        self.assertEqual(len(combined.reminders), 6)
+        self.assertEqual(combined.summary['by_category']['birthdays'], 6)
+        with self.assertRaises(ReminderError):
+            reminders.combine_reminder_plans(first, first)
+
     def test_control_uses_calendar_days_and_exact_hours(self):
         result = plan([resource(event("one", "DTSTART:20261015T120000Z", "SUMMARY:Review"))])
         self.assertEqual([(item.rule, item.notify_at) for item in result.reminders], [
@@ -88,13 +97,35 @@ class ReminderTests(unittest.TestCase):
         self.assertEqual([item.rule for item in plan([birthday]).reminders], ["d3", "d1", "d0"])
 
     def test_no_birthday_from_names_all_day_annual_or_partial_words(self):
-        for title in ("Synthetic Person", "ДРЕЛЬ", "birthdayish", "Подготовка к дню рождения"):
+        for title in ("Synthetic Person", "ДРЕЛЬ", "birthdayish", "Подготовка к дню рождения",
+                      "Synthetic Person’s 46t...", "Synthetic Person’s 46th", "Synthetic Person 46th",
+                      "46th", "Synthetic Person’s 46th birthdayish", "Synthetic Person’s 46th meeting",
+                      "Synthetic Person’s 46t birthday", "Synthetic Person’s 46 birthday"):
             with self.subTest(title=title):
                 item = resource(event("neutral", "DTSTART;VALUE=DATE:20261015",
                     "RRULE:FREQ=YEARLY;COUNT=1", f"SUMMARY:{title}"), source="icloud")
                 result = plan([item])
                 self.assertEqual(result.reminders, [])
                 self.assertEqual(result.summary["series_without_policy"], 1)
+
+    def test_yearly_possessive_ordinal_birthdays_use_three_morning_reminders(self):
+        for source in ("icloud", "mailru_1"):
+            for apostrophe in ("'", "’"):
+                for ordinal in ("1st", "2nd", "3rd", "11th", "12th", "13th", "21st", "22nd", "23rd", "46th"):
+                    title = f"Synthetic Person{apostrophe}s {ordinal} Birthday"
+                    with self.subTest(source=source, title=title):
+                        item = resource(event("birthday", "DTSTART;VALUE=DATE:20201020",
+                            "RRULE:FREQ=YEARLY", f"SUMMARY:{title}"), source=source)
+                        result = plan([item], start="2026-10-15T00:00:00+03:00",
+                                      end="2026-10-22T00:00:00+03:00")
+                        self.assertEqual([(entry.rule, entry.notify_at) for entry in result.reminders], [
+                            ("d3", "2026-10-17T09:00:00+03:00"),
+                            ("d1", "2026-10-19T09:00:00+03:00"),
+                            ("d0", "2026-10-20T09:00:00+03:00"),
+                        ])
+                        self.assertTrue(all(entry.category == "birthdays" and entry.title == title
+                                            and entry.classification_evidence == ("title",)
+                                            for entry in result.reminders))
 
     def test_every_invitation_participation_is_retained(self):
         resources = [resource(event(status, "DTSTART:20261015T120000Z", "STATUS:TENTATIVE",

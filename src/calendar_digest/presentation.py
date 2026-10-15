@@ -35,7 +35,10 @@ _HOLIDAY_TITLES = {
     "new year’s day", "thanksgiving", "thanksgiving day",
 }
 
-_BIRTHDAY_TITLE = re.compile(r"^(?:день\s+рождения|birthday)\b|\b(?:'s|’s)\s+birthday\b")
+_BIRTHDAY_TITLE = re.compile(
+    r"^(?:день\s+рождения|birthday)\b|"
+    r"\b(?:'s|’s)\s+(?:[0-9]+(?:st|nd|rd|th)\s+)?birthday\b"
+)
 _MEETING_TITLE = re.compile(
     r"^(?:встреча|совещание|созвон|переговоры|собеседование|meeting|interview|call)\b"
 )

@@ -23,6 +23,43 @@ class RuntimeTests(unittest.TestCase):
                 runtime.schedule_enabled({"DIGEST_SCHEDULE_ENABLED": value})
             self.assertEqual(str(error.exception), "DIGEST_SCHEDULE_ENABLED должен быть true или false.")
 
+    def test_push_schedule_has_its_own_strict_default_disabled_flag(self):
+        self.assertFalse(runtime.push_schedule_enabled({"DIGEST_SCHEDULE_ENABLED": "true"}))
+        self.assertFalse(runtime.push_schedule_enabled({"PUSH_SCHEDULE_ENABLED": "false"}))
+        self.assertTrue(runtime.push_schedule_enabled({"PUSH_SCHEDULE_ENABLED": "true"}))
+        for value in ("1", "yes", "TRUE", " true", "", "private-key"):
+            with self.subTest(value=value), self.assertRaises(runtime.RuntimeConfigurationError) as error:
+                runtime.push_schedule_enabled({"PUSH_SCHEDULE_ENABLED": value})
+            self.assertEqual(str(error.exception), "PUSH_SCHEDULE_ENABLED должен быть true или false.")
+
+    def test_both_schedules_and_each_schedule_alone_get_separate_processes(self):
+        for mail, push in ((False, False), (True, False), (False, True), (True, True)):
+            with self.subTest(mail=mail, push=push):
+                commands = runtime.service_commands(Path("/example"), port=10000,
+                                                    enabled=mail, push_enabled=push)
+                self.assertEqual(len(commands), 1 + mail + push)
+                schedulers = [command[-1] for command in commands[1:]]
+                self.assertEqual("calendar_digest.scheduler" in schedulers, mail)
+                self.assertEqual("calendar_digest.push_scheduler" in schedulers, push)
+
+    def test_push_configuration_failure_does_not_block_web_or_email_startup(self):
+        for push_settings in ({}, {"PUSHOVER_APP_TOKEN": "malformed-private-key"}):
+            with self.subTest(push_settings=bool(push_settings)), patch.dict(os.environ, {
+                "DIGEST_SCHEDULE_ENABLED": "true", "PUSH_SCHEDULE_ENABLED": "true", **push_settings,
+            }, clear=True), patch.object(runtime, "validate_smtp_settings") as validate, \
+                    patch.object(runtime, "supervise", return_value=0) as supervisor, redirect_stdout(StringIO()):
+                self.assertEqual(runtime.main(), 0)
+                validate.assert_called_once()
+                self.assertEqual(len(supervisor.call_args.args[0]), 3)
+
+    def test_push_only_does_not_validate_smtp(self):
+        with patch.dict(os.environ, {"PUSH_SCHEDULE_ENABLED": "true"}, clear=True), \
+                patch.object(runtime, "validate_smtp_settings") as validate, \
+                patch.object(runtime, "supervise", return_value=0) as supervisor, redirect_stdout(StringIO()):
+            self.assertEqual(runtime.main(), 0)
+        validate.assert_not_called()
+        self.assertEqual(supervisor.call_args.args[0][-1][-1], "calendar_digest.push_scheduler")
+
     def test_port_is_a_valid_tcp_port_and_never_echoes_bad_input(self):
         self.assertEqual(runtime.service_port({}), 10000)
         self.assertEqual(runtime.service_port({"PORT": "65535"}), 65535)
