@@ -15,6 +15,7 @@ dependencies = [
     "Flask==3.1.2",
     "gunicorn==23.0.0",
     "ijson==3.4.0.post0",
+    "cryptography==50.0.0",
 ]
 
 [project.scripts]
