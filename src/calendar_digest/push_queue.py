@@ -148,7 +148,7 @@ class QueueStore:
             self.connection.execute("PRAGMA synchronous=FULL")
             self.connection.execute("PRAGMA journal_mode=DELETE")
             version = self.connection.execute("PRAGMA user_version").fetchone()[0]
-            if version not in (0, 1):
+            if version not in (0, 1, 2):
                 raise QueueError("Версия защищённого расписания push не поддерживается.")
             with self.connection:
                 self.connection.execute("CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY,value TEXT NOT NULL)")
@@ -181,7 +181,8 @@ class QueueStore:
                     )
                 """)
                 self.connection.execute("CREATE INDEX IF NOT EXISTS reminders_due ON reminders(state,notify_at)")
-                self.connection.execute("PRAGMA user_version=1")
+                if version == 0:
+                    self.connection.execute("PRAGMA user_version=1")
             os.fsync(directory_fd)
         except BaseException:
             self.close()
@@ -215,9 +216,77 @@ class QueueStore:
     def recover(self, now):
         # The exclusive flock proves that no previous sender is still working.
         with self.connection:
+            self._migrate_contact_identities(now)
             self.connection.execute("UPDATE reminders SET state='uncertain',retryable=0,retry_at=NULL,updated_at=? "
                                     "WHERE state='sending'", (_timestamp(now),))
             self._expire(now)
+            # Versions before the canonical-identity migration only accept v1.
+            # Refuse rollback to those senders: they could recreate raw URL
+            # identities and bypass already accepted canonical receipts.
+            self.connection.execute("PRAGMA user_version=2")
+
+    def _migrate_contact_identities(self, now):
+        """Coalesce historical CardDAV host aliases without replaying receipts.
+
+        Called inside recovery's transaction while holding the process lock.
+        Normalizing again on subsequent opens also handles legacy records that
+        may have been restored. The version gate blocks older senders afterward.
+        """
+        from .contact_identity import canonical_contact_book_id
+
+        contacts = {}
+        contacts_changed = False
+        for record in self.connection.execute("SELECT book_id,uid,name,month,day FROM birthday_contacts"):
+            original = dict(record)
+            contact = dict(original, book_id=canonical_contact_book_id(original["book_id"]))
+            _contact_row(contact)
+            key = (contact["book_id"], contact["uid"])
+            if key in contacts and contacts[key] != contact:
+                raise QueueError("Противоречивые записи дней рождения; обновление идентификаторов остановлено.")
+            contacts_changed |= contact != original or key in contacts
+            contacts[key] = contact
+
+        groups = {}
+        for record in self.connection.execute("SELECT * FROM reminders"):
+            payload = json.loads(record["payload"])
+            if not isinstance(payload, dict) or payload.get("source_id") != "icloud_contacts":
+                continue
+            original_id, _, _ = _reminder_row(payload)
+            if original_id != record["stable_id"]:
+                raise QueueError("Не подтверждена идентичность сохранённого дня рождения.")
+            payload["calendar_id"] = canonical_contact_book_id(payload["calendar_id"])
+            identity = [payload["source_id"], payload["calendar_id"], payload["uid"],
+                        payload.get("recurrence_id"), payload["rule"]]
+            stable_id = hashlib.sha256(_json(identity).encode("utf-8")).hexdigest()
+            payload["stable_id"] = stable_id
+            updated = dict(record, stable_id=stable_id, payload=_json(payload))
+            if updated["state"] == "sending":
+                updated.update(state="uncertain", retryable=0, retry_at=None, updated_at=_timestamp(now))
+            groups.setdefault(stable_id, []).append((dict(record), updated))
+
+        # Validate every group before replacing any rows. Contacts with equal
+        # identities but different names/dates require a fresh source decision.
+        if contacts_changed:
+            self.connection.execute("DELETE FROM birthday_contacts")
+            self.connection.executemany("INSERT INTO birthday_contacts VALUES (?,?,?,?,?)",
+                                        [tuple(contact[field] for field in _CONTACT_FIELDS)
+                                         for _, contact in sorted(contacts.items())])
+        ranks = {"accepted": 4, "uncertain": 3, "pending": 2, "failed": 2,
+                 "cancelled": 1, "expired": 1}
+        for stable_id, variants in groups.items():
+            original, chosen = max(variants, key=lambda pair: (
+                ranks[pair[1]["state"]], pair[1]["updated_at"], pair[1]["created_at"], pair[0]["stable_id"],
+            ))
+            if len(variants) == 1 and original == chosen:
+                continue
+            self.connection.executemany("DELETE FROM reminders WHERE stable_id=?",
+                                        [(old["stable_id"],) for old, _ in variants])
+            self.connection.execute("""
+                INSERT INTO reminders(stable_id,notify_at,payload,state,retryable,retry_at,created_at,updated_at)
+                VALUES (?,?,?,?,?,?,?,?)
+            """, tuple(chosen[field] for field in (
+                "stable_id", "notify_at", "payload", "state", "retryable", "retry_at", "created_at", "updated_at",
+            )))
 
     def load_cache(self):
         return [dict(row) for row in self.connection.execute(
