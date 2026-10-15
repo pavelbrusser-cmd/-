@@ -10,6 +10,8 @@ import os
 from typing import TYPE_CHECKING, Iterable, Mapping
 from zoneinfo import ZoneInfo
 
+from .contact_identity import canonical_contact_book_id
+
 if TYPE_CHECKING:
     from .contact_birthdays_source import ContactBirthday
     from .reminders import ReminderPlan
@@ -72,7 +74,11 @@ def plan_contact_birthdays(
             if type(contact.month) is not int or type(contact.day) is not int:
                 raise ReminderError("Некорректная дата дня рождения; план не сформирован.")
             date(2000, contact.month, contact.day)  # Accept February 29, reject impossible dates.
-            identity = (contact.book_id, contact.uid)
+            # Cached records created before canonical IDs were introduced may
+            # contain a routing URL. Normalize pure-planner inputs as well as
+            # live collection so these records have exactly the same identity.
+            book_id = canonical_contact_book_id(contact.book_id)
+            identity = (book_id, contact.uid)
             details = (contact.name, contact.month, contact.day)
             if identity in seen:
                 if seen[identity] != details:
@@ -96,7 +102,7 @@ def plan_contact_birthdays(
                     if not start <= notify_at < end:
                         continue
                     reminders.append(Reminder(
-                        source_id="icloud_contacts", calendar_id=contact.book_id,
+                        source_id="icloud_contacts", calendar_id=book_id,
                         calendar_name="Дни рождения · iCloud Contacts", uid=contact.uid,
                         recurrence_id=f"birthday:{year}", title=f"День рождения · {contact.name}",
                         event_start=birthday.isoformat(), all_day=True, category="birthdays",

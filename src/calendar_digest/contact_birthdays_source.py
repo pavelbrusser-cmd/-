@@ -16,6 +16,7 @@ from xml.etree import ElementTree as ET
 import niquests
 
 from .calendar_collection import _quiet_library_logs
+from .contact_identity import canonical_contact_book_id
 from .icloud import Credentials
 from .readonly_caldav import CalendarConnectionError, connect_readonly
 
@@ -341,6 +342,10 @@ def collect_contact_birthdays(credentials=None) -> BirthdayCollection:
                 books = _books(client, home, budget=budget)
                 for book in books:
                     root, actual_book = _query_birthdays(client, book, budget=budget)
+                    # Routing hosts and URL spelling are not address-book
+                    # identity. Use the final validated collection URL after
+                    # redirects so pending work and receipts survive aliases.
+                    book_id = canonical_contact_book_id(actual_book)
                     for href, props in _records(root, actual_book):
                         if _member(actual_book, href) is None:
                             raise _error()
@@ -348,7 +353,7 @@ def collect_contact_birthdays(credentials=None) -> BirthdayCollection:
                         if data is None or not data.text or cards_read >= MAX_CONTACTS:
                             raise _error()
                         cards_read += 1
-                        contact = _birthday(data.text, book)
+                        contact = _birthday(data.text, book_id)
                         if contact is None:
                             continue
                         identity = contact.book_id, contact.uid

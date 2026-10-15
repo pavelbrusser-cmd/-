@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 
 from calendar_digest import contact_birthdays
 from calendar_digest.contact_birthdays import contact_birthdays_enabled, plan_contact_birthdays
+from calendar_digest.contact_identity import canonical_contact_book_id
 from calendar_digest.reminders import ReminderError
 
 
@@ -97,6 +98,37 @@ class ContactBirthdayTests(unittest.TestCase):
 
     def test_namesakes_and_separate_addressbooks_remain_separate(self):
         plan = self.plan([Contact(), Contact(uid="other-contact"), Contact(book_id="book-2")])
+        self.assertEqual(len(plan.reminders), 9)
+        self.assertEqual(len({item.stable_id for item in plan.reminders}), 9)
+        self.assertEqual(plan.summary["series_total"], 3)
+
+    def test_book_url_aliases_produce_identical_annual_reminder_ids(self):
+        original = "https://contacts.icloud.com/123/carddavhome/book/"
+        expected = self.plan([Contact(book_id=original)])
+        aliases = (
+            "https://p42-contacts.icloud.com/123/carddavhome/book/",
+            "https://p43-contacts.icloud.com/123/carddavhome/book",
+            "https://p42-contacts.icloud.com/123/carddavhome/%62ook/",
+            canonical_contact_book_id(original),
+        )
+        for alias in aliases:
+            with self.subTest(alias=alias):
+                actual = self.plan([Contact(book_id=alias)])
+                self.assertEqual(actual, expected)
+                self.assertEqual({item.stable_id for item in actual.reminders},
+                                 {item.stable_id for item in expected.reminders})
+        duplicates = self.plan([Contact(book_id=original), Contact(book_id=aliases[0])])
+        self.assertEqual(duplicates, expected)
+        with self.assertRaises(ReminderError):
+            self.plan([Contact(book_id=original), Contact(book_id=aliases[0], day=19)])
+
+    def test_equal_uid_in_different_accounts_or_books_remains_distinct(self):
+        books = (
+            "https://contacts.icloud.com/123/carddavhome/book/",
+            "https://p42-contacts.icloud.com/456/carddavhome/book/",
+            "https://p43-contacts.icloud.com/123/carddavhome/other/",
+        )
+        plan = self.plan([Contact(book_id=book) for book in books])
         self.assertEqual(len(plan.reminders), 9)
         self.assertEqual(len({item.stable_id for item in plan.reminders}), 9)
         self.assertEqual(plan.summary["series_total"], 3)

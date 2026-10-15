@@ -23,6 +23,8 @@ RESOURCE = {"source_id": "mailru_2", "calendar_id": "private-calendar",
             "data": "BEGIN:VCALENDAR\nprivate calendar content\nEND:VCALENDAR"}
 CONTACT = {"book_id": "private-book", "uid": "private-contact", "name": "Личное имя",
            "month": 10, "day": 18}
+CONTACT_BOOK_A = "https://contacts.icloud.com/123456/carddavhome/card/"
+CONTACT_BOOK_B = "https://p12-contacts.icloud.com/123456/carddavhome/%63ard"
 
 
 def reminder(*, at=NOW, uid="private-uid", rule="h3", title="Личное поручение"):
@@ -31,6 +33,17 @@ def reminder(*, at=NOW, uid="private-uid", rule="h3", title="Личное пор
               "title": title, "event_start": (at + timedelta(hours=3)).isoformat(),
               "all_day": False, "category": "control", "rule": rule,
               "notify_at": at.isoformat(), "classification_evidence": []}
+    identity = [result[key] for key in ("source_id", "calendar_id", "uid", "recurrence_id", "rule")]
+    result["stable_id"] = hashlib.sha256(json.dumps(identity, ensure_ascii=False,
+                                                   separators=(",", ":")).encode()).hexdigest()
+    return result
+
+
+def contact_reminder(book, *, at=NOW, day=18, title="Личное имя", uid="private-contact"):
+    result = dict(reminder(at=at, uid=uid, rule="d3", title=title),
+                  source_id="icloud_contacts", calendar_id=book,
+                  recurrence_id="birthday:2026", event_start=f"2026-10-{day:02}",
+                  all_day=True, category="birthdays", classification_evidence=["contacts"])
     identity = [result[key] for key in ("source_id", "calendar_id", "uid", "recurrence_id", "rule")]
     result["stable_id"] = hashlib.sha256(json.dumps(identity, ensure_ascii=False,
                                                    separators=(",", ":")).encode()).hexdigest()
@@ -61,6 +74,23 @@ class QueueTests(unittest.TestCase):
         with sqlite3.connect(self.database) as database:
             database.row_factory = sqlite3.Row
             return [dict(row) for row in database.execute("SELECT * FROM reminders ORDER BY notify_at")]
+
+    def legacy_contacts(self, contacts, attempts):
+        """Insert a historical store exactly as the previous release wrote it."""
+        with self.store() as store:
+            store.activate(NOW)
+            store.mark_sync(NOW, 11, {})
+        with sqlite3.connect(self.database) as database:
+            database.execute("PRAGMA user_version=1")
+            database.executemany("INSERT INTO birthday_contacts VALUES (?,?,?,?,?)",
+                                 [tuple(contact[field] for field in ("book_id", "uid", "name", "month", "day"))
+                                  for contact in contacts])
+            for payload, state, updated, retryable, retry_at in attempts:
+                database.execute("""INSERT INTO reminders VALUES (?,?,?,?,?,?,?,?)""", (
+                    payload["stable_id"], datetime.fromisoformat(payload["notify_at"]).timestamp(),
+                    push_queue._json(payload), state, int(retryable),
+                    None if retry_at is None else retry_at.timestamp(), NOW.timestamp(), updated.timestamp(),
+                ))
 
     def test_private_files_managed_root_and_manual_test_database_untouched(self):
         self.directory.mkdir(mode=0o775)
@@ -171,6 +201,176 @@ class QueueTests(unittest.TestCase):
             with self.assertRaises(QueueError):
                 store.mark_sync(NOW, 11, {}, addressbook_count=0)
             self.assertTrue(store.summary(NOW)["contacts_enabled"])
+
+    def test_contact_alias_pending_beats_cancelled_and_snapshot_coalesces(self):
+        from calendar_digest.contact_identity import canonical_contact_book_id
+
+        old, active = contact_reminder(CONTACT_BOOK_A), contact_reminder(CONTACT_BOOK_B)
+        # Cancelled can be newer: the currently active alias still takes priority.
+        self.legacy_contacts([dict(CONTACT, book_id=CONTACT_BOOK_A), dict(CONTACT, book_id=CONTACT_BOOK_B)], [
+            (old, "cancelled", NOW + timedelta(seconds=1), False, None),
+            (active, "pending", NOW, True, None),
+        ])
+        canonical = canonical_contact_book_id(CONTACT_BOOK_A)
+        with self.store() as store:
+            self.assertEqual(store.load_contacts(), [dict(CONTACT, book_id=canonical)])
+            due = store.due(NOW)
+            self.assertEqual(len(due), 1)
+            self.assertEqual(due[0]["calendar_id"], canonical)
+            self.assertEqual(store.summary(NOW)["counts"]["cancelled"], 0)
+            self.assertTrue(store.claim(due[0]["stable_id"], now=NOW))
+
+    def test_contact_alias_accepted_receipt_dominates_new_pending_date_correction(self):
+        from calendar_digest.contact_identity import canonical_contact_book_id
+
+        old = contact_reminder(CONTACT_BOOK_A, title="Имя при отправке")
+        pending = contact_reminder(CONTACT_BOOK_B, at=NOW + timedelta(minutes=2), day=19, title="Новое имя")
+        self.legacy_contacts([], [
+            (old, "accepted", NOW, False, None),
+            (pending, "pending", NOW + timedelta(seconds=1), True, None),
+        ])
+        with self.store() as store:
+            self.assertEqual(store.due(NOW + timedelta(minutes=2)), [])
+            self.assertEqual(store.summary(NOW)["counts"]["accepted"], 1)
+            self.assertEqual(store.summary(NOW)["counts"]["pending"], 0)
+        saved = self.raw()[0]
+        payload = json.loads(saved["payload"])
+        self.assertEqual(payload["calendar_id"], canonical_contact_book_id(CONTACT_BOOK_A))
+        self.assertEqual(payload["title"], old["title"])
+        self.assertEqual(payload["event_start"], old["event_start"])
+        self.assertEqual(saved["notify_at"], NOW.timestamp())
+        # Replanning the corrected canonical event must not create a second send.
+        canonical_pending = contact_reminder(canonical_contact_book_id(CONTACT_BOOK_B),
+                                             at=NOW + timedelta(minutes=2), day=19, title="Новое имя")
+        with self.store() as store:
+            self.plan(store, [canonical_pending])
+            self.assertEqual(store.due(NOW + timedelta(minutes=2)), [])
+            self.assertEqual(store.summary(NOW)["counts"]["accepted"], 1)
+
+    def test_contact_alias_uncertain_and_interrupted_sending_dominate_pending(self):
+        for index, state in enumerate(("uncertain", "sending")):
+            with self.subTest(state=state):
+                uid = f"contact-{index}"
+                old, active = contact_reminder(CONTACT_BOOK_A, uid=uid), contact_reminder(CONTACT_BOOK_B, uid=uid)
+                self.legacy_contacts([], [
+                    (old, state, NOW, False, None),
+                    (active, "pending", NOW + timedelta(seconds=1), True, None),
+                ])
+                with self.store() as store:
+                    self.assertEqual(store.due(NOW), [])
+                    self.assertEqual(store.summary(NOW)["counts"]["uncertain"], index + 1)
+                    self.assertEqual(store.summary(NOW)["counts"]["pending"], 0)
+
+    def test_contact_alias_latest_active_failure_preserves_retry_delay(self):
+        old, failed = contact_reminder(CONTACT_BOOK_A), contact_reminder(CONTACT_BOOK_B)
+        retry_at = NOW + timedelta(minutes=1)
+        self.legacy_contacts([], [
+            (old, "pending", NOW, True, None),
+            (failed, "failed", NOW + timedelta(seconds=1), True, retry_at),
+        ])
+        with self.store() as store:
+            self.assertEqual(store.due(NOW), [])
+            self.assertEqual(len(store.due(retry_at)), 1)
+        self.assertEqual(self.raw()[0]["state"], "failed")
+        self.assertEqual(self.raw()[0]["retry_at"], retry_at.timestamp())
+        self.assertEqual(self.raw()[0]["retryable"], 1)
+
+    def test_contact_alias_nonretryable_failure_remains_stopped(self):
+        old, failed = contact_reminder(CONTACT_BOOK_A), contact_reminder(CONTACT_BOOK_B)
+        self.legacy_contacts([], [
+            (old, "pending", NOW, True, None),
+            (failed, "failed", NOW + timedelta(seconds=1), False, None),
+        ])
+        with self.store() as store:
+            self.assertEqual(store.due(NOW), [])
+        self.assertEqual(self.raw()[0]["state"], "failed")
+        self.assertEqual(self.raw()[0]["retryable"], 0)
+
+    def test_contact_migration_keeps_other_accounts_books_and_calendar_payloads_distinct(self):
+        books = [CONTACT_BOOK_A,
+                 "https://contacts.icloud.com/123456/carddavhome/other/",
+                 "https://contacts.icloud.com/654321/carddavhome/card/"]
+        calendar = reminder()
+        self.legacy_contacts([dict(CONTACT, book_id=book) for book in books],
+            [(contact_reminder(book), "pending", NOW, True, None) for book in books]
+            + [(calendar, "pending", NOW, True, None)])
+        calendar_before = next(row for row in self.raw() if row["stable_id"] == calendar["stable_id"])
+        with self.store() as store:
+            self.assertEqual(len(store.load_contacts()), 3)
+            self.assertEqual(len(store.due(NOW)), 4)
+            self.assertEqual(len({item["calendar_id"] for item in store.due(NOW)
+                                  if item["source_id"] == "icloud_contacts"}), 3)
+        calendar_after = next(row for row in self.raw() if row["stable_id"] == calendar["stable_id"])
+        self.assertEqual(calendar_before, calendar_after)
+
+    def test_contact_identity_migration_is_idempotent(self):
+        self.legacy_contacts([dict(CONTACT, book_id=CONTACT_BOOK_A)], [
+            (contact_reminder(CONTACT_BOOK_A), "pending", NOW, True, None),
+        ])
+        with self.store() as store:
+            contacts = store.load_contacts()
+            self.assertEqual(store.connection.execute("PRAGMA user_version").fetchone()[0], 2)
+        first = self.raw()
+        with self.store() as store:
+            self.assertEqual(store.load_contacts(), contacts)
+            self.assertEqual(store.connection.execute("PRAGMA user_version").fetchone()[0], 2)
+        self.assertEqual(self.raw(), first)
+
+    def test_new_store_marks_version_two_only_after_successful_recovery(self):
+        original = push_queue.QueueStore._migrate_contact_identities
+        versions = []
+
+        def migration(store, now):
+            versions.append(store.connection.execute("PRAGMA user_version").fetchone()[0])
+            return original(store, now)
+
+        with patch.object(push_queue.QueueStore, "_migrate_contact_identities", migration):
+            with self.store() as store:
+                self.assertEqual(store.connection.execute("PRAGMA user_version").fetchone()[0], 2)
+        self.assertEqual(versions, [1])
+
+    def test_failed_initial_recovery_does_not_mark_database_migrated(self):
+        with patch.object(push_queue.QueueStore, "_migrate_contact_identities", side_effect=QueueError("migration stopped")):
+            with self.assertRaises(QueueError), self.store():
+                pass
+        with sqlite3.connect(self.database) as database:
+            self.assertEqual(database.execute("PRAGMA user_version").fetchone()[0], 1)
+        with self.store() as store:
+            self.assertEqual(store.connection.execute("PRAGMA user_version").fetchone()[0], 2)
+
+    def test_conflicting_contact_alias_snapshot_rolls_back_every_identity(self):
+        initial_contacts = [dict(CONTACT, book_id=CONTACT_BOOK_A), dict(CONTACT, book_id=CONTACT_BOOK_B, day=19)]
+        self.legacy_contacts(initial_contacts, [
+            (contact_reminder(CONTACT_BOOK_A), "accepted", NOW, False, None),
+            (contact_reminder(CONTACT_BOOK_B), "pending", NOW, True, None),
+        ])
+        before = self.raw()
+        with self.assertRaises(QueueError) as failure, self.store():
+            pass
+        self.assertNotIn(CONTACT["name"], str(failure.exception))
+        self.assertNotIn(CONTACT_BOOK_A, str(failure.exception))
+        self.assertEqual(self.raw(), before)
+        with sqlite3.connect(self.database) as database:
+            self.assertEqual(database.execute("PRAGMA user_version").fetchone()[0], 1)
+            database.row_factory = sqlite3.Row
+            after_contacts = [dict(row) for row in database.execute("SELECT * FROM birthday_contacts ORDER BY book_id")]
+        self.assertEqual(after_contacts, sorted(initial_contacts, key=lambda row: row["book_id"]))
+
+    def test_database_failure_after_contact_write_rolls_back_contacts_and_receipts(self):
+        contact = dict(CONTACT, book_id=CONTACT_BOOK_A)
+        self.legacy_contacts([contact], [(contact_reminder(CONTACT_BOOK_A), "accepted", NOW, False, None)])
+        before = self.raw()
+        with sqlite3.connect(self.database) as database:
+            database.execute("""CREATE TRIGGER reject_migration BEFORE INSERT ON reminders
+                BEGIN SELECT RAISE(ABORT,'private storage failure'); END""")
+        with self.assertRaises(QueueError) as failure, self.store():
+            pass
+        self.assertNotIn("private storage failure", str(failure.exception))
+        self.assertEqual(self.raw(), before)
+        with sqlite3.connect(self.database) as database:
+            self.assertEqual(database.execute("PRAGMA user_version").fetchone()[0], 1)
+            database.row_factory = sqlite3.Row
+            self.assertEqual(dict(database.execute("SELECT * FROM birthday_contacts").fetchone()), contact)
 
     def test_first_activation_expires_backlog_and_is_idempotent(self):
         earlier = reminder(at=NOW - timedelta(minutes=1), uid="earlier")

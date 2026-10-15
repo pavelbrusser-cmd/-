@@ -14,6 +14,7 @@ import niquests
 from calendar_digest.contact_birthdays_source import (
     ContactBirthday, _birthday, collect_contact_birthdays,
 )
+from calendar_digest.contact_identity import canonical_contact_book_id
 from calendar_digest.icloud import Credentials
 from calendar_digest.readonly_caldav import CalendarConnectionError
 from test_icloud import response_for
@@ -54,6 +55,7 @@ class ContactBirthdaySourceTests(unittest.TestCase):
         self.mutate = lambda stage, body: body
         self.fail_stage = None
         self.http_status = 207
+        self.final_book_url = None
         self.expected_authorization = "Basic " + base64.b64encode(f"{USER}:{PASSWORD}".encode()).decode()
 
     def send(self, session, request, **kwargs):
@@ -94,23 +96,57 @@ class ContactBirthdaySourceTests(unittest.TestCase):
             self.assertEqual(len(filters), 1)
             self.assertEqual(filters[0].attrib, {"name": "BDAY"})
             self.assertEqual(len(filters[0]), 0)
-            body = multistatus(*[record(request.url + filename,
+            final_book = self.final_book_url or request.url
+            body = multistatus(*[record(final_book.rstrip("/") + "/" + filename,
                 f"<c:address-data>{escape(data)}</c:address-data>")
                 for filename, data in self.books[request.url].items()])
         else:
             self.fail("Unexpected HTTP destination")
         if stage == self.fail_stage:
             raise RuntimeError(f"private server response {PASSWORD} {request.url}")
-        return response_for(request, self.mutate(stage, body), status=self.http_status)
+        response = response_for(request, self.mutate(stage, body), status=self.http_status)
+        if stage == "contacts" and self.final_book_url is not None:
+            # Simulate the validated final HTTP response following a redirect;
+            # all resource hrefs belong to that final collection.
+            response.url = self.final_book_url
+            response.history = [response_for(request, "", status=307)]
+        return response
 
     def test_projects_only_required_fields_and_returns_no_birth_year_or_raw_card(self):
         result = collect_contact_birthdays()
         self.assertEqual(result.addressbooks, 1)
-        self.assertEqual(result.contacts, [ContactBirthday(BOOK, "fictional-uid", "Вымышленное имя", 10, 18)])
+        self.assertEqual(result.contacts, [ContactBirthday(canonical_contact_book_id(BOOK),
+                                                          "fictional-uid", "Вымышленное имя", 10, 18)])
         self.assertEqual({field.name for field in fields(result.contacts[0])}, {"book_id", "uid", "name", "month", "day"})
         for private in ("BEGIN:VCARD", "1990", "Вымышленное имя", "fictional-uid", PASSWORD):
             self.assertNotIn(private, repr(result))
         self.assertEqual([method for method, _ in self.calls], ["PROPFIND", "PROPFIND", "PROPFIND", "REPORT"])
+
+    def test_final_report_host_aliases_and_url_spellings_keep_book_identity(self):
+        original = collect_contact_birthdays().contacts
+        for destination in (
+            "https://contacts.icloud.com/123/carddavhome/book/",
+            "https://p43-contacts.icloud.com/123/carddavhome/book/",
+            "https://p42-contacts.icloud.com/123/carddavhome/book",
+            "https://p43-contacts.icloud.com/123/carddavhome/%62ook/",
+        ):
+            with self.subTest(destination=destination):
+                self.final_book_url = destination
+                self.assertEqual(collect_contact_birthdays().contacts, original)
+
+    def test_final_report_collection_path_is_used_after_redirect(self):
+        destination = "https://p43-contacts.icloud.com/123/carddavhome/relocated/"
+        self.final_book_url = destination
+        contact = collect_contact_birthdays().contacts[0]
+        self.assertEqual(contact.book_id, canonical_contact_book_id(destination))
+        self.assertNotEqual(contact.book_id, canonical_contact_book_id(BOOK))
+
+    def test_same_contact_uid_in_distinct_addressbooks_stays_separate(self):
+        self.books[HOME + "second/"] = {"two.vcf": card()}
+        contacts = collect_contact_birthdays().contacts
+        self.assertEqual(len(contacts), 2)
+        self.assertEqual(contacts[0].uid, contacts[1].uid)
+        self.assertNotEqual(contacts[0].book_id, contacts[1].book_id)
 
     def test_credentials_can_be_supplied_without_environment(self):
         with patch.dict(os.environ, {}, clear=True):
