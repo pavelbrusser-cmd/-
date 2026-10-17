@@ -9,7 +9,6 @@ from dataclasses import asdict
 from datetime import date, datetime, timedelta, timezone
 import os
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 from .calendar_operation_lock import calendar_operation_lock
 from .calendar_sync import CachedResource, sync_calendars, to_calendar_resources
@@ -19,14 +18,14 @@ from .push_queue import (
     HORIZON_DAYS, OVERDUE_GRACE_SECONDS, QueueError, schedule_store,
 )
 from .push_transport import PushoverSettings, PushError, PushUncertain, send_notification
+from .push_timing import MOSCOW, delivery_allowed, reminder_was_deferred
 from .reminders import combine_reminder_plans, plan_reminders
 from .runtime import push_schedule_enabled
 
 
-MOSCOW = ZoneInfo("Europe/Moscow")
 CONTROL_SOURCE = "mailru_2"
 MAX_BATCH = 50
-POLICY_VERSION = "1"
+POLICY_VERSION = "2"
 
 
 class PushCycleError(Exception):
@@ -60,7 +59,11 @@ def notification_text(reminder: dict) -> tuple[str, str]:
     reasons = {"d3": "за 3 дня", "d1": "за 1 день", "d0": "сегодня",
                "h3": "за 3 часа", "h1": "за 1 час"}
     try:
-        title = f"{labels[reminder['category']]} · {reasons[reminder['rule']]}"
+        reason = reasons[reminder["rule"]]
+        if reminder["rule"] in {"h1", "h3"} and reminder_was_deferred(
+                reminder["event_start"], reminder["rule"], reminder["notify_at"]):
+            reason = "перенесено на 07:00 МСК"
+        title = f"{labels[reminder['category']]} · {reason}"
         if reminder["all_day"]:
             event_time = date.fromisoformat(reminder["event_start"]).strftime("%d.%m.%Y") + " · весь день"
         else:
@@ -120,6 +123,8 @@ def _refresh(store, *, clock):
 def _send_due(store, settings, *, clock):
     accepted = failed = uncertain = 0
     refresh_required = False
+    if not delivery_allowed(_instant(clock())):
+        return {"accepted": 0, "failed": 0, "uncertain": 0, "refresh_required": False}
     if not store.summary(_instant(clock()))["sync_fresh_for_delivery"]:
         return {"accepted": 0, "failed": 0, "uncertain": 0, "refresh_required": True}
     for reminder in store.due(_instant(clock()), limit=MAX_BATCH):
@@ -129,6 +134,8 @@ def _send_due(store, settings, *, clock):
 
         def before_send():
             nonlocal claimed
+            # Claim checks the actual Moscow delivery window again after device
+            # validation, including a midnight crossed during that request.
             if not store.claim(identifier, now=_instant(clock())):
                 raise _ClaimSkipped()
             claimed = True

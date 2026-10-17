@@ -18,10 +18,9 @@ import sys
 import tempfile
 import threading
 import time
-from zoneinfo import ZoneInfo
+from .push_timing import MOSCOW, normalize_notification_time
 
 
-MOSCOW = ZoneInfo("Europe/Moscow")
 REFRESH_DELAY = timedelta(minutes=5)
 RETRY_DELAY = timedelta(seconds=60)
 OVERDUE_DELAY = timedelta(seconds=30)
@@ -56,11 +55,11 @@ def next_run(now: datetime, summary: dict) -> datetime:
     if value is None:
         return refresh_at
     try:
-        due = _local(datetime.fromisoformat(value))
+        due = normalize_notification_time(_local(datetime.fromisoformat(value)))
     except (ValueError, TypeError, PushSchedulerError):
         raise PushSchedulerError("Не удалось прочитать время следующего уведомления.") from None
     if due <= now:
-        due = now + OVERDUE_DELAY
+        due = normalize_notification_time(now + OVERDUE_DELAY)
     return min(refresh_at, due)
 
 

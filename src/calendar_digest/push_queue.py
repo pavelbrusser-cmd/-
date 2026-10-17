@@ -16,6 +16,8 @@ from pathlib import Path
 import sqlite3
 import stat
 
+from .push_timing import MOSCOW, NOT_BEFORE, delivery_allowed, normalize_notification_time
+
 
 HORIZON_DAYS = 7
 OVERDUE_GRACE_SECONDS = 15 * 60
@@ -124,6 +126,16 @@ def _contact_row(contact):
     return tuple(contact[field] for field in _CONTACT_FIELDS)
 
 
+def _only_delivery_time_changed(prior, due, payload):
+    """A policy update is not a newly moved event that can revive stopped work."""
+    original = datetime.fromtimestamp(prior["notify_at"], timezone.utc)
+    if due <= prior["notify_at"] or normalize_notification_time(original).timestamp() != due:
+        return False
+    previous, proposed = json.loads(prior["payload"]), json.loads(payload)
+    previous["notify_at"] = proposed["notify_at"]
+    return previous == proposed
+
+
 class QueueStore:
     """Use only while holding ``schedule_store``'s exclusive process lock."""
 
@@ -148,7 +160,7 @@ class QueueStore:
             self.connection.execute("PRAGMA synchronous=FULL")
             self.connection.execute("PRAGMA journal_mode=DELETE")
             version = self.connection.execute("PRAGMA user_version").fetchone()[0]
-            if version not in (0, 1, 2):
+            if version not in (0, 1, 2, 3):
                 raise QueueError("Версия защищённого расписания push не поддерживается.")
             with self.connection:
                 self.connection.execute("CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY,value TEXT NOT NULL)")
@@ -217,13 +229,43 @@ class QueueStore:
         # The exclusive flock proves that no previous sender is still working.
         with self.connection:
             self._migrate_contact_identities(now)
+            self._normalize_pending_times(now)
             self.connection.execute("UPDATE reminders SET state='uncertain',retryable=0,retry_at=NULL,updated_at=? "
                                     "WHERE state='sending'", (_timestamp(now),))
             self._expire(now)
-            # Versions before the canonical-identity migration only accept v1.
-            # Refuse rollback to those senders: they could recreate raw URL
-            # identities and bypass already accepted canonical receipts.
-            self.connection.execute("PRAGMA user_version=2")
+            # Older senders cannot enforce the delivery window, and releases
+            # before v2 could also recreate noncanonical contact identities.
+            # Publish the version gate only after the entire migration commits.
+            self.connection.execute("PRAGMA user_version=3")
+
+    def _normalize_pending_times(self, now):
+        """Move unsent night work to 07:00 before applying the overdue limit.
+
+        Receipt identities remain unchanged. Interrupted submissions and other
+        terminal states must never be revived by a delivery-policy migration.
+        """
+        rows = self.connection.execute(
+            "SELECT * FROM reminders WHERE state='pending' OR (state='failed' AND retryable=1)"
+        ).fetchall()
+        for row in rows:
+            original = datetime.fromtimestamp(row["notify_at"], timezone.utc)
+            deferred = normalize_notification_time(original)
+            if deferred == original:
+                continue
+            payload = json.loads(row["payload"])
+            identity, due, _ = _reminder_row(payload)
+            if identity != row["stable_id"] or due != row["notify_at"]:
+                raise QueueError("Не подтверждено время сохранённого напоминания.")
+            payload["notify_at"] = deferred.isoformat()
+            retry_at = row["retry_at"]
+            if retry_at is not None:
+                retry_at = normalize_notification_time(
+                    datetime.fromtimestamp(retry_at, timezone.utc)
+                ).timestamp()
+            self.connection.execute(
+                "UPDATE reminders SET notify_at=?,payload=?,retry_at=?,updated_at=? WHERE stable_id=?",
+                (deferred.timestamp(), _json(payload), retry_at, _timestamp(now), identity),
+            )
 
     def _migrate_contact_identities(self, now):
         """Coalesce historical CardDAV host aliases without replaying receipts.
@@ -360,6 +402,10 @@ class QueueStore:
                     continue
                 state, retryable, retry_at = "pending", 1, None
                 if prior is not None:
+                    stopped = (prior["state"] in {"expired", "cancelled"}
+                               or (prior["state"] == "failed" and not prior["retryable"]))
+                    if stopped and _only_delivery_time_changed(prior, due, payload):
+                        continue
                     if prior["state"] == "failed" and prior["payload"] == payload:
                         state, retryable, retry_at = "failed", prior["retryable"], prior["retry_at"]
                     elif prior["state"] in {"expired", "cancelled"} and due < stamp:
@@ -404,7 +450,7 @@ class QueueStore:
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1000:
             raise QueueError("Некорректный размер очереди push.")
         activation = self._get("activated_at")
-        if activation is None:
+        if activation is None or not delivery_allowed(now):
             return []
         rows = self.connection.execute("""
             SELECT payload FROM reminders WHERE (state='pending' OR (state='failed' AND retryable=1))
@@ -418,7 +464,8 @@ class QueueStore:
         stamp = _timestamp(now)
         activation = self._get("activated_at")
         observed = self._get("last_observation_at", self._get("last_sync_at"))
-        if activation is None or observed is None or not 0 <= stamp - observed <= SYNC_FRESH_SECONDS:
+        if (not delivery_allowed(now) or activation is None or observed is None
+                or not 0 <= stamp - observed <= SYNC_FRESH_SECONDS):
             return False
         with self.connection:
             updated = self.connection.execute("""
@@ -462,6 +509,8 @@ class QueueStore:
                 WHERE (state='pending' OR (state='failed' AND retryable=1)) AND notify_at>=?
             """, (activated,)).fetchone()[0]
         return {"activated_at": _iso(activated), "last_sync_at": _iso(synced),
+                "delivery_not_before": NOT_BEFORE.strftime("%H:%M"),
+                "delivery_timezone": MOSCOW.key,
                 "last_observation_at": _iso(observed),
                 "sync_recent": synced is not None and 0 <= stamp - synced <= SYNC_HEALTH_SECONDS,
                 "sync_fresh_for_delivery": observed is not None and 0 <= stamp - observed <= SYNC_FRESH_SECONDS,

@@ -148,6 +148,19 @@ class ReminderPreviewTests(unittest.TestCase):
         self.assertIn("За 3 часа", html)
         self.assertIn("18.10.2026 · весь день", html)
 
+    def test_deferred_hourly_notice_shows_seven_and_honest_reason(self):
+        early = resource("early", ";TZID=Europe/Moscow:20261015T040000", "Early synthetic")
+        result = self.run_preview(Collection([early], 1), days=1)
+        payload = json.loads(Path(result["preview_json"]).read_text())
+        reminder, = payload["reminders"]
+        self.assertEqual(reminder["notify_at"], "2026-10-15T07:00:00+03:00")
+        self.assertEqual(reminder["rule"], "h3")
+        html = Path(result["preview_html"]).read_text()
+        self.assertIn("07:00<span>МСК</span>", html)
+        self.assertIn("Перенесено на 07:00 МСК", html)
+        self.assertIn("Событие: 15.10.2026 в 04:00", html)
+        self.assertNotIn("За 3 часа", html)
+
     def test_one_day_window_keeps_future_events_but_only_that_days_notifications(self):
         result = self.run_preview(days=1)
         payload = json.loads(Path(result["preview_json"]).read_text())

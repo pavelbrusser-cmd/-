@@ -312,15 +312,111 @@ class AutomaticPushTests(unittest.TestCase):
         self.assertEqual(self.sender.call_count, 1)
 
     def test_policy_change_and_horizon_rollover_force_replanning(self):
-        self.prepare()
+        with patch('calendar_digest.push_automation.POLICY_VERSION', '1'):
+            self.prepare()
         self.changed = 0
         with patch('calendar_digest.push_automation.plan_reminders', wraps=push_automation.plan_reminders) as planner:
-            with patch('calendar_digest.push_automation.POLICY_VERSION', '2'):
-                self.prepare()
-                self.assertEqual(self.summary()['policy_version'], '2')
-                self.now += timedelta(days=1, seconds=1)
-                self.prepare()
+            self.prepare()
+            self.assertEqual(self.summary()['policy_version'], '2')
+            self.now += timedelta(days=1, seconds=1)
+            self.prepare()
             self.assertEqual(planner.call_count, 2)
+
+    def test_morning_delivery_waits_until_seven_and_restart_does_not_repeat(self):
+        self.now = datetime(2026, 10, 15, 3, 59, tzinfo=timezone.utc)  # 06:59 Moscow.
+        self.resources = [cached(start='20261015T050000Z')]  # 08:00 event; h3 moves 05:00 -> 07:00.
+        first = self.run_cycle()
+        self.assertEqual(first['queue']['next_due_at'], '2026-10-15T04:00:00+00:00')
+        self.assertFalse(first['sent'])
+        self.assertFalse(first['refresh_required'])
+        self.sender.assert_not_called()
+        self.changed = 0
+        self.now += timedelta(minutes=1)
+        self.assertEqual(self.run_cycle()['accepted'], 1)
+        self.assertEqual(self.sender.call_args.kwargs['title'], 'Поручение · перенесено на 07:00 МСК')
+        self.assertEqual(self.run_cycle()['accepted'], 0)
+        self.assertEqual(self.summary()['counts']['accepted'], 1)
+        self.assertEqual(self.sender.call_count, 1)
+        self.assertEqual(self.collect.call_count, 3)
+
+    def test_event_already_started_before_seven_still_gets_morning_notification(self):
+        self.now = datetime(2026, 10, 15, 4, tzinfo=timezone.utc)
+        self.resources = [cached(start='20261015T020000Z')]  # Event itself was at 05:00 Moscow.
+        result = self.run_cycle()
+        self.assertEqual(result['accepted'], 1)
+        self.assertIn('перенесено на 07:00 МСК', self.sender.call_args.kwargs['title'])
+        self.assertIn('15.10.2026 в 05:00 МСК', self.sender.call_args.kwargs['message'])
+
+    def test_preexisting_night_queue_migrates_before_expiry_then_fresh_sync_sends(self):
+        self.now = datetime(2026, 10, 15, 1, tzinfo=timezone.utc)  # Existing service activated at 04:00.
+        self.resources = [cached(start='20261015T050000Z')]
+        with patch('calendar_digest.push_automation.POLICY_VERSION', '1'):
+            self.run_cycle()
+        self.sender.assert_not_called()
+        database = self.directory / 'push-schedule' / 'schedule.sqlite3'
+        legacy_due = datetime(2026, 10, 15, 2, tzinfo=timezone.utc)  # Former 05:00 push.
+        with sqlite3.connect(database) as connection:
+            identifier, encoded = connection.execute('SELECT stable_id,payload FROM reminders').fetchone()
+            payload = json.loads(encoded)
+            payload['notify_at'] = legacy_due.isoformat()
+            connection.execute('UPDATE reminders SET notify_at=?,payload=? WHERE stable_id=?',
+                               (legacy_due.timestamp(), json.dumps(payload), identifier))
+            connection.execute('PRAGMA user_version=2')
+        self.changed = 0
+        self.now = datetime(2026, 10, 15, 3, 59, tzinfo=timezone.utc)
+        with patch('calendar_digest.push_automation.plan_reminders', wraps=push_automation.plan_reminders) as planner:
+            migrated = self.run_cycle()
+            planner.assert_called_once()
+        self.assertEqual(migrated['queue']['policy_version'], '2')
+        self.assertEqual(migrated['queue']['counts']['expired'], 0)
+        self.assertEqual(migrated['queue']['counts']['pending'], 1)
+        self.assertEqual(migrated['queue']['next_due_at'], '2026-10-15T04:00:00+00:00')
+        self.sender.assert_not_called()
+        self.now += timedelta(minutes=1)
+        self.collect.side_effect = CalendarConnectionError('safe collection failure')
+        with self.assertRaises(QueueError):
+            self.run_cycle()
+        self.sender.assert_not_called()
+        self.collect.side_effect = self.sync
+        self.assertEqual(self.run_cycle()['accepted'], 1)
+        self.assertEqual(self.sender.call_count, 1)
+
+    def test_policy_upgrade_replans_unchanged_calendars_without_replaying_receipts(self):
+        self.resources = [cached('accepted'), cached('uncertain')]
+        def mixed(settings, *, before_send, **kwargs):
+            before_send()
+            if self.sender.call_count == 2:
+                raise PushUncertain('safe lost response')
+            return {'state': 'accepted', 'encrypted': True}
+        self.sender.side_effect = mixed
+        with patch('calendar_digest.push_automation.POLICY_VERSION', '1'):
+            previous = self.run_cycle()
+        self.assertEqual(previous['accepted'], 1)
+        self.assertEqual(previous['uncertain'], 1)
+        self.changed = 0
+        with patch('calendar_digest.push_automation.plan_reminders', wraps=push_automation.plan_reminders) as planner:
+            current = self.run_cycle()
+            planner.assert_called_once()
+        self.assertEqual(current['queue']['policy_version'], '2')
+        self.assertEqual(current['accepted'], 0)
+        self.assertEqual(current['queue']['counts']['accepted'], 1)
+        self.assertEqual(current['queue']['counts']['uncertain'], 1)
+        self.assertEqual(self.sender.call_count, 2)
+
+    def test_device_validation_crossing_midnight_cannot_submit_at_night(self):
+        self.now = datetime(2026, 10, 15, 20, 59, 59, tzinfo=timezone.utc)
+        self.resources = [cached(start='20261015T235959Z')]
+        def crosses_midnight(settings, *, before_send, **kwargs):
+            self.now += timedelta(seconds=2)
+            before_send()
+            self.fail('No HTTP submission is allowed after crossing Moscow midnight')
+        self.sender.side_effect = crosses_midnight
+        result = self.run_cycle()
+        self.assertFalse(result['sent'])
+        self.assertTrue(result['refresh_required'])
+        self.assertEqual(result['queue']['counts']['pending'], 1)
+        self.assertEqual(result['queue']['counts']['accepted'], 0)
+        self.assertEqual(result['queue']['counts']['uncertain'], 0)
 
     def test_batch_limit_leaves_remaining_due_items_for_next_fresh_cycle(self):
         self.resources = [cached(str(number)) for number in range(3)]
@@ -341,6 +437,29 @@ class AutomaticPushTests(unittest.TestCase):
 
 
 class PushFormattingTests(unittest.TestCase):
+    def test_deferred_hourly_notification_uses_an_honest_morning_label(self):
+        for rule, start in [('h3', '2026-10-15T08:00:00+03:00'),
+                            ('h1', '2026-10-15T03:00:00+00:00')]:
+            with self.subTest(rule=rule):
+                title, message = notification_text({
+                    'category': 'control', 'rule': rule, 'all_day': False,
+                    'event_start': start, 'notify_at': '2026-10-15T04:00:00+00:00',
+                    'title': 'Проверка', 'calendar_name': 'Контроль',
+                })
+                self.assertEqual(title, 'Поручение · перенесено на 07:00 МСК')
+                self.assertIn('15.10.2026 в ', message)
+
+    def test_hourly_notification_without_deferral_keeps_exact_interval_label(self):
+        for rule, start, reason in [('h3', '2026-10-15T10:00:00+03:00', 'за 3 часа'),
+                                    ('h1', '2026-10-15T08:00:00+03:00', 'за 1 час')]:
+            with self.subTest(rule=rule):
+                title, _ = notification_text({
+                    'category': 'control', 'rule': rule, 'all_day': False,
+                    'event_start': start, 'notify_at': '2026-10-15T07:00:00+03:00',
+                    'title': 'Проверка', 'calendar_name': 'Контроль',
+                })
+                self.assertEqual(title, 'Поручение · ' + reason)
+
     def test_birthday_text_is_plain_bounded_and_has_calendar_date(self):
         title, message = notification_text({'category':'birthdays','rule':'d1', 'all_day':True,
             'event_start':'2026-10-16', 'title':'<b>Имя</b>\x00\n' + 'Я' * 2000,

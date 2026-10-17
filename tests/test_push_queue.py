@@ -75,13 +75,13 @@ class QueueTests(unittest.TestCase):
             database.row_factory = sqlite3.Row
             return [dict(row) for row in database.execute("SELECT * FROM reminders ORDER BY notify_at")]
 
-    def legacy_contacts(self, contacts, attempts):
+    def legacy_contacts(self, contacts, attempts, *, now=NOW, version=1):
         """Insert a historical store exactly as the previous release wrote it."""
-        with self.store() as store:
-            store.activate(NOW)
-            store.mark_sync(NOW, 11, {})
+        with self.store(now) as store:
+            store.activate(now)
+            store.mark_sync(now, 11, {})
         with sqlite3.connect(self.database) as database:
-            database.execute("PRAGMA user_version=1")
+            database.execute(f"PRAGMA user_version={version}")
             database.executemany("INSERT INTO birthday_contacts VALUES (?,?,?,?,?)",
                                  [tuple(contact[field] for field in ("book_id", "uid", "name", "month", "day"))
                                   for contact in contacts])
@@ -89,7 +89,7 @@ class QueueTests(unittest.TestCase):
                 database.execute("""INSERT INTO reminders VALUES (?,?,?,?,?,?,?,?)""", (
                     payload["stable_id"], datetime.fromisoformat(payload["notify_at"]).timestamp(),
                     push_queue._json(payload), state, int(retryable),
-                    None if retry_at is None else retry_at.timestamp(), NOW.timestamp(), updated.timestamp(),
+                    None if retry_at is None else retry_at.timestamp(), now.timestamp(), updated.timestamp(),
                 ))
 
     def test_private_files_managed_root_and_manual_test_database_untouched(self):
@@ -309,14 +309,14 @@ class QueueTests(unittest.TestCase):
         ])
         with self.store() as store:
             contacts = store.load_contacts()
-            self.assertEqual(store.connection.execute("PRAGMA user_version").fetchone()[0], 2)
+            self.assertEqual(store.connection.execute("PRAGMA user_version").fetchone()[0], 3)
         first = self.raw()
         with self.store() as store:
             self.assertEqual(store.load_contacts(), contacts)
-            self.assertEqual(store.connection.execute("PRAGMA user_version").fetchone()[0], 2)
+            self.assertEqual(store.connection.execute("PRAGMA user_version").fetchone()[0], 3)
         self.assertEqual(self.raw(), first)
 
-    def test_new_store_marks_version_two_only_after_successful_recovery(self):
+    def test_new_store_marks_version_three_only_after_successful_recovery(self):
         original = push_queue.QueueStore._migrate_contact_identities
         versions = []
 
@@ -326,7 +326,7 @@ class QueueTests(unittest.TestCase):
 
         with patch.object(push_queue.QueueStore, "_migrate_contact_identities", migration):
             with self.store() as store:
-                self.assertEqual(store.connection.execute("PRAGMA user_version").fetchone()[0], 2)
+                self.assertEqual(store.connection.execute("PRAGMA user_version").fetchone()[0], 3)
         self.assertEqual(versions, [1])
 
     def test_failed_initial_recovery_does_not_mark_database_migrated(self):
@@ -336,7 +336,7 @@ class QueueTests(unittest.TestCase):
         with sqlite3.connect(self.database) as database:
             self.assertEqual(database.execute("PRAGMA user_version").fetchone()[0], 1)
         with self.store() as store:
-            self.assertEqual(store.connection.execute("PRAGMA user_version").fetchone()[0], 2)
+            self.assertEqual(store.connection.execute("PRAGMA user_version").fetchone()[0], 3)
 
     def test_conflicting_contact_alias_snapshot_rolls_back_every_identity(self):
         initial_contacts = [dict(CONTACT, book_id=CONTACT_BOOK_A), dict(CONTACT, book_id=CONTACT_BOOK_B, day=19)]
@@ -385,6 +385,195 @@ class QueueTests(unittest.TestCase):
         with self.store() as store:
             self.plan(store, [earlier, current])
             self.assertEqual(store.due(NOW), [current])
+
+    def test_night_migration_runs_before_expiry_when_restart_is_after_seven(self):
+        seven = NOW.replace(hour=4)  # 07:00 Moscow, independently of server TZ.
+        original = reminder(at=seven - timedelta(hours=4))
+        restarted = seven + timedelta(minutes=5)
+        self.legacy_contacts([], [(original, "pending", seven, True, None)],
+                             now=seven - timedelta(hours=8), version=2)
+        with self.store(restarted) as store:
+            migrated = store.due(restarted)
+            self.assertEqual(len(migrated), 1)
+            self.assertEqual(migrated[0], dict(original, notify_at="2026-10-15T07:00:00+03:00"))
+            summary = store.summary(restarted)
+            self.assertEqual(summary["delivery_not_before"], "07:00")
+            self.assertEqual(summary["delivery_timezone"], "Europe/Moscow")
+            self.assertEqual(summary["counts"]["expired"], 0)
+            self.assertEqual(store.connection.execute("PRAGMA user_version").fetchone()[0], 3)
+            self.assertFalse(store.claim(original["stable_id"], now=restarted))  # Still needs a fresh scan.
+            store.mark_sync(restarted, 11, {})
+            self.assertTrue(store.claim(original["stable_id"], now=restarted))
+            store.complete(original["stable_id"], "accepted", now=restarted)
+        with self.store(restarted) as store:
+            self.plan(store, migrated, now=restarted)
+            self.assertEqual(store.due(restarted), [])
+            self.assertEqual(store.summary(restarted)["counts"]["accepted"], 1)
+
+    def test_migration_before_seven_waits_and_is_idempotent_on_restart(self):
+        seven = NOW.replace(hour=4)
+        original = reminder(at=seven - timedelta(hours=1))
+        earlier = seven - timedelta(minutes=30)
+        self.legacy_contacts([], [(original, "pending", earlier, True, None)],
+                             now=seven - timedelta(hours=8), version=2)
+        with self.store(earlier) as store:
+            self.assertEqual(store.due(earlier), [])
+            self.assertEqual(store.summary(earlier)["next_due_at"], seven.isoformat())
+            self.assertFalse(store.claim(original["stable_id"], now=earlier))
+        first = self.raw()
+        with self.store(seven) as store:
+            self.assertEqual(len(store.due(seven)), 1)
+            self.assertEqual(store.due(seven - timedelta(microseconds=1)), [])
+            store.mark_sync(seven, 11, {})
+            self.assertFalse(store.claim(original["stable_id"], now=seven - timedelta(microseconds=1)))
+        self.assertEqual(self.raw(), first)
+
+    def test_migrated_reminder_keeps_exact_fifteen_minute_grace(self):
+        seven = NOW.replace(hour=4)
+        boundary = seven + timedelta(minutes=15)
+        entries = [reminder(at=seven - timedelta(hours=4), uid=uid) for uid in ("first", "second")]
+        self.legacy_contacts([], [(item, "pending", seven, True, None) for item in entries],
+                             now=seven - timedelta(hours=8), version=2)
+        with self.store(boundary) as store:
+            self.assertEqual(len(store.due(boundary)), 2)
+            store.mark_sync(boundary, 11, {})
+            self.assertTrue(store.claim(entries[0]["stable_id"], now=boundary))
+            store.complete(entries[0]["stable_id"], "accepted", now=boundary)
+        with self.store(boundary + timedelta(microseconds=1)) as store:
+            self.assertEqual(store.due(boundary + timedelta(microseconds=1)), [])
+            self.assertEqual(store.summary(boundary + timedelta(microseconds=1))["counts"]["expired"], 1)
+
+    def test_first_restart_beyond_migrated_grace_expires_without_backfill(self):
+        seven = NOW.replace(hour=4)
+        original = reminder(at=seven - timedelta(hours=4))
+        restarted = seven + timedelta(minutes=15, seconds=1)
+        self.legacy_contacts([], [(original, "pending", seven, True, None)],
+                             now=seven - timedelta(hours=8), version=2)
+        with self.store(restarted) as store:
+            self.assertEqual(store.due(restarted), [])
+            self.assertEqual(store.summary(restarted)["counts"]["expired"], 1)
+
+    def test_retryable_night_failures_keep_backoff_across_migration_and_refresh(self):
+        seven = NOW.replace(hour=4)
+        restarted = seven + timedelta(minutes=5)
+        first = reminder(at=seven - timedelta(hours=4), uid="first")
+        second = reminder(at=seven - timedelta(hours=4), uid="second")
+        later_retry = seven + timedelta(minutes=6)
+        self.legacy_contacts([], [
+            (first, "failed", seven, True, seven - timedelta(hours=3, minutes=59)),
+            (second, "failed", seven, True, later_retry),
+        ], now=seven - timedelta(hours=8), version=2)
+        normalized = [dict(item, notify_at="2026-10-15T07:00:00+03:00") for item in (first, second)]
+        with self.store(restarted) as store:
+            self.assertEqual(store.due(restarted), [normalized[0]])
+            self.plan(store, normalized, now=restarted)
+            self.assertEqual(store.due(restarted), [normalized[0]])
+            self.assertEqual(len(store.due(later_retry)), 2)
+        rows = {row["stable_id"]: row for row in self.raw()}
+        self.assertEqual(rows[first["stable_id"]]["retry_at"], seven.timestamp())
+        self.assertEqual(rows[second["stable_id"]]["retry_at"], later_retry.timestamp())
+        self.assertTrue(all(row["state"] == "failed" and row["retryable"] == 1 for row in rows.values()))
+
+    def test_night_migration_never_changes_receipts_or_revives_stopped_work(self):
+        seven = NOW.replace(hour=4)
+        opened = seven - timedelta(hours=5)
+        states = ("accepted", "uncertain", "sending", "failed", "cancelled", "expired")
+        entries = [reminder(at=seven - timedelta(hours=4), uid=state) for state in states]
+        self.legacy_contacts([], [(item, state, opened, False, None) for item, state in zip(entries, states)],
+                             now=seven - timedelta(hours=8), version=2)
+        before = {row["stable_id"]: row for row in self.raw()}
+        with self.store(opened) as store:
+            self.assertEqual(store.due(opened), [])
+        after = {row["stable_id"]: row for row in self.raw()}
+        for entry, state in zip(entries, states):
+            old, new = before[entry["stable_id"]], after[entry["stable_id"]]
+            self.assertEqual(new["notify_at"], old["notify_at"])
+            self.assertEqual(new["payload"], old["payload"])
+            self.assertEqual(new["state"], "uncertain" if state == "sending" else state)
+        with self.store(seven) as store:
+            self.assertEqual(store.due(seven), [])
+
+    def test_policy_only_replan_does_not_revive_stopped_work_but_actual_move_can(self):
+        seven = NOW.replace(hour=4)
+        replanned = seven - timedelta(hours=1)
+        states = ("expired", "cancelled", "failed")
+        entries = [reminder(at=seven - timedelta(hours=4), uid=state) for state in states]
+        self.legacy_contacts([], [(item, state, replanned, False, None)
+                                 for item, state in zip(entries, states)],
+                             now=seven - timedelta(hours=8), version=2)
+        normalized = [dict(item, notify_at="2026-10-15T07:00:00+03:00") for item in entries]
+        with self.store(replanned) as store:
+            before = self.raw()
+            self.plan(store, normalized, now=replanned)
+            self.assertEqual(self.raw(), before)
+            self.assertEqual(store.due(seven), [])
+            # A true event move remains a new authoritative scheduling decision.
+            moved = [dict(item, event_start="2026-10-15T10:00:00+03:00") for item in normalized]
+            self.plan(store, moved, now=replanned)
+            self.assertEqual(len(store.due(seven)), 3)
+
+    def test_policy_only_replan_preserves_permanent_failure_before_old_due_time(self):
+        seven = NOW.replace(hour=4)
+        replanned = seven - timedelta(minutes=10)
+        item = reminder(at=seven - timedelta(minutes=5))
+        self.legacy_contacts([], [(item, "failed", replanned, False, None)],
+                             now=seven - timedelta(hours=8), version=2)
+        with self.store(replanned) as store:
+            before = self.raw()
+            self.plan(store, [dict(item, notify_at="2026-10-15T07:00:00+03:00")], now=replanned)
+            self.assertEqual(self.raw(), before)
+            self.assertEqual(store.summary(replanned)["counts"]["failed"], 1)
+            self.assertEqual(store.due(seven), [])
+
+    def test_quiet_hours_block_due_and_claim_on_actual_midnight_clock(self):
+        last_minute = NOW.replace(hour=20, minute=59)  # Moscow 23:59.
+        midnight = last_minute + timedelta(minutes=1)
+        item = reminder(at=last_minute)
+        with self.store(last_minute) as store:
+            store.activate(last_minute)
+            self.plan(store, [item], now=last_minute)
+            self.assertEqual(store.due(last_minute), [item])
+            # A batch chosen before midnight must not be submitted after it.
+            self.assertEqual(store.due(midnight), [])
+            self.assertFalse(store.claim(item["stable_id"], now=midnight))
+            self.assertEqual(self.raw()[0]["state"], "pending")
+
+    def test_retry_crossing_midnight_is_blocked_then_expires_without_seven_hour_delay(self):
+        last_minute = NOW.replace(hour=20, minute=59)
+        midnight = last_minute + timedelta(minutes=1)
+        seven = midnight + timedelta(hours=7)
+        item = reminder(at=last_minute)
+        with self.store(last_minute) as store:
+            store.activate(last_minute)
+            self.plan(store, [item], now=last_minute)
+            self.assertTrue(store.claim(item["stable_id"], now=last_minute))
+            store.complete(item["stable_id"], "failed", now=last_minute, retryable=True)
+        with self.store(midnight) as store:
+            store.mark_sync(midnight, 11, {})
+            self.assertEqual(store.due(midnight), [])
+            self.assertFalse(store.claim(item["stable_id"], now=midnight))
+            row = self.raw()[0]
+            self.assertEqual(row["notify_at"], last_minute.timestamp())
+            self.assertEqual(row["retry_at"], midnight.timestamp())
+        with self.store(seven) as store:
+            self.assertEqual(store.due(seven), [])
+            self.assertEqual(store.summary(seven)["counts"]["expired"], 1)
+
+    def test_night_migration_failure_rolls_back_rows_and_version_two(self):
+        seven = NOW.replace(hour=4)
+        original = reminder(at=seven - timedelta(hours=4))
+        self.legacy_contacts([], [(original, "pending", seven, True, None)],
+                             now=seven - timedelta(hours=8), version=2)
+        before = self.raw()
+        with sqlite3.connect(self.database) as database:
+            database.execute("""CREATE TRIGGER reject_night_migration AFTER UPDATE OF notify_at ON reminders
+                BEGIN SELECT RAISE(ABORT,'private migration detail'); END""")
+        with self.assertRaises(QueueError) as failure, self.store(seven):
+            pass
+        self.assertNotIn("private migration detail", str(failure.exception))
+        self.assertEqual(self.raw(), before)
+        with sqlite3.connect(self.database) as database:
+            self.assertEqual(database.execute("PRAGMA user_version").fetchone()[0], 2)
 
     def test_checkpoint_is_durable_before_submission_and_acceptance_is_permanent(self):
         item = reminder()
