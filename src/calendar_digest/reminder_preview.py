@@ -21,6 +21,7 @@ from .contact_birthdays import contact_birthdays_enabled, plan_contact_birthdays
 from .contact_birthdays_source import BirthdayCollection, collect_contact_birthdays
 from .local_state import write_private
 from .reminders import Reminder, combine_reminder_plans, plan_reminders
+from .push_timing import reminder_was_deferred
 
 
 MOSCOW = ZoneInfo("Europe/Moscow")
@@ -96,6 +97,8 @@ def render_reminder_preview(
         for moment, reminder in items:
             category = CATEGORY_LABELS[reminder.category]
             reason = RULE_LABELS[reminder.rule]
+            if reminder_was_deferred(reminder.event_start, reminder.rule, reminder.notify_at):
+                reason = "Перенесено на 07:00 МСК"
             source = SOURCE_LABELS.get(reminder.source_id, reminder.source_id)
             cards.append(
                 '<article class="reminder">'
@@ -160,7 +163,8 @@ footer{{padding:10px 0 30px;color:#718097;font-size:13px}}
 <header><p class="eyebrow">Уведомления на телефон · предпросмотр</p>
 <h1>Ваше расписание напоминаний</h1>
 <p class="lead">{start:%d.%m.%Y} — {last:%d.%m.%Y}</p>
-<p class="note">Все даты и время — московские (Europe/Moscow). Ниже указано время уведомления; дата и время самого события приведены отдельно.</p></header>
+<p class="note">Все даты и время — московские (Europe/Moscow). Ниже указано время уведомления; дата и время самого события приведены отдельно.</p>
+<p class="note">Уведомления с 00:00 до 06:59 переносятся на 07:00 того же дня, даже если событие начинается раньше.</p></header>
 <p class="notice"><strong>Это предпросмотр.</strong> Уведомления не отправлялись. Расписание рассчитано по свежим данным календарей; изменения событий могут изменить его.</p>
 <div class="statistics">{statistics}</div>
 {''.join(sections)}

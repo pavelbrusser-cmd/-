@@ -18,6 +18,7 @@ import recurring_ical_events
 
 from . import selection
 from .presentation import _BIRTHDAY_TITLE, _normalized
+from .push_timing import normalize_notification_time
 
 
 MAX_WINDOW_DAYS = 31
@@ -238,7 +239,8 @@ def plan_reminders(
     """Plan notification times in the half-open interval, without sending.
 
     D−3/D−1 use Moscow calendar dates, not 72/24 elapsed hours. The timed
-    offsets remain exact even across midnight. Birthday policy takes priority;
+    offsets are calculated before the permanent 07:00 Moscow floor,
+    including across midnight. Birthday policy takes priority;
     periodic English title markers override only the selected control source.
     All participation states are retained, while STATUS:CANCELLED is excluded.
 
@@ -287,6 +289,7 @@ def plan_reminders(
                 for name in evidence:
                     summary["classification_evidence"][name] += 1
                 for rule, notify_at in _schedule(event, category, morning_time):
+                    notify_at = normalize_notification_time(notify_at)
                     if not window_start <= notify_at < window_end:
                         continue
                     reminder = Reminder(

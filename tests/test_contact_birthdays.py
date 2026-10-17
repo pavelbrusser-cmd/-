@@ -155,6 +155,13 @@ class ContactBirthdayTests(unittest.TestCase):
         self.assertEqual(empty.reminders, [])
         self.assertEqual(empty.summary["series_total"], 0)
 
+    def test_early_custom_morning_is_floored_before_notification_window(self):
+        plan = plan_contact_birthdays([Contact()], window_start=moment("2026-10-18T07:00"),
+                                     window_end=moment("2026-10-18T07:01"), morning_time=time(5))
+        reminder, = plan.reminders
+        self.assertEqual(reminder.rule, "d0")
+        self.assertEqual(reminder.notify_at, "2026-10-18T07:00:00+03:00")
+
     def test_invalid_dates_and_incomplete_contacts_fail_without_content(self):
         for contact in (Contact(day=32), Contact(month=2, day=30), Contact(month=True),
                         Contact(uid=""), Contact(name=" "), Contact(book_id="")):

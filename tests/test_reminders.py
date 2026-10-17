@@ -54,6 +54,67 @@ class ReminderTests(unittest.TestCase):
         self.assertEqual(result.summary["by_category"]["control"], 3)
         json.dumps(asdict(result))
 
+    def test_early_hourly_reminders_follow_same_day_seven_policy(self):
+        cases = (
+            ("20261015T080000", "Review", "h3", "2026-10-15T07:00:00+03:00"),
+            ("20261015T040000", "Review", "h3", "2026-10-15T07:00:00+03:00"),
+            ("20261015T060000", "Review weekly", "h1", "2026-10-15T07:00:00+03:00"),
+            ("20261015T095959", "Review", "h3", "2026-10-15T07:00:00+03:00"),
+            ("20261015T100000", "Review", "h3", "2026-10-15T07:00:00+03:00"),
+            ("20261015T100001", "Review", "h3", "2026-10-15T07:00:01+03:00"),
+            ("20261015T010000", "Review", "h3", "2026-10-14T22:00:00+03:00"),
+        )
+        for start, title, rule, expected in cases:
+            with self.subTest(start=start, rule=rule):
+                data = resource(event("one", f"DTSTART;TZID=Europe/Moscow:{start}", f"SUMMARY:{title}"))
+                entries = plan([data]).reminders
+                hourly, = [item for item in entries if item.rule == rule]
+                self.assertEqual(hourly.notify_at, expected)
+                self.assertTrue(all(datetime.fromisoformat(item.notify_at).hour >= 7 for item in entries))
+                # The rule identity, including an already consumed receipt,
+                # survives a change to its actual delivery timestamp.
+                self.assertEqual(hourly.stable_id,
+                                 replace(hourly, notify_at="2026-10-15T01:00:00+03:00").stable_id)
+
+    def test_deferred_event_before_window_is_kept_and_window_is_half_open(self):
+        data = resource(event("early", "DTSTART;TZID=Europe/Moscow:20261015T040000", "SUMMARY:Review"))
+        cases = (
+            ("2026-10-15T06:30:00+03:00", "2026-10-15T07:00:00+03:00", 0),
+            ("2026-10-15T07:00:00+03:00", "2026-10-15T07:00:01+03:00", 1),
+            ("2026-10-15T07:00:00.000001+03:00", "2026-10-15T07:01:00+03:00", 0),
+        )
+        for start, end, count in cases:
+            with self.subTest(start=start):
+                entries = plan([data], start=start, end=end).reminders
+                self.assertEqual(len(entries), count)
+                if entries:
+                    self.assertEqual(entries[0].event_start, "2026-10-15T04:00:00+03:00")
+                    self.assertEqual(entries[0].notify_at, "2026-10-15T07:00:00+03:00")
+
+    def test_floor_uses_moscow_date_and_timezone_before_window_filtering(self):
+        data = resource(event("foreign", "DTSTART;TZID=Asia/Tokyo:20261015T120000", "SUMMARY:Review weekly"))
+        result = plan([data], start="2026-10-15T04:00:00+00:00", end="2026-10-15T04:01:00+00:00")
+        reminder, = result.reminders
+        self.assertEqual(reminder.event_start, "2026-10-15T06:00:00+03:00")
+        self.assertEqual(reminder.notify_at, "2026-10-15T07:00:00+03:00")
+
+    def test_early_series_respects_exclusions_and_moved_occurrences(self):
+        master = resource(event("series", "DTSTART;TZID=Europe/Moscow:20261015T080000",
+                                "RRULE:FREQ=DAILY;COUNT=3", "EXDATE;TZID=Europe/Moscow:20261016T080000",
+                                "SUMMARY:Review"))
+        override = resource(event("series", "RECURRENCE-ID;TZID=Europe/Moscow:20261017T080000",
+                                  "DTSTART;TZID=Europe/Moscow:20261017T120000", "SUMMARY:Review"))
+        entries = plan([master, override], start="2026-10-15T00:00:00+03:00",
+                       end="2026-10-18T00:00:00+03:00").reminders
+        self.assertEqual([item.notify_at for item in entries if item.rule == "h3"],
+                         ["2026-10-15T07:00:00+03:00", "2026-10-17T09:00:00+03:00"])
+
+    def test_custom_early_morning_also_respects_service_floor(self):
+        data = resource(event("birthday", "DTSTART;VALUE=DATE:20261018", "SUMMARY:Birthday Person"), source="icloud")
+        entries = plan([data], morning_time=time(5)).reminders
+        self.assertEqual(len(entries), 3)
+        self.assertEqual({datetime.fromisoformat(item.notify_at).time() for item in entries}, {time(7)})
+
     def test_periodic_words_override_control_only_and_match_whole_words(self):
         for word in ("weekly", "MONTHLY", "Quarterly", "yearly", "daily", "biweekly"):
             with self.subTest(word=word):

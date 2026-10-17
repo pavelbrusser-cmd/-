@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Iterable, Mapping
 from zoneinfo import ZoneInfo
 
 from .contact_identity import canonical_contact_book_id
+from .push_timing import normalize_notification_time
 
 if TYPE_CHECKING:
     from .contact_birthdays_source import ContactBirthday
@@ -98,7 +99,7 @@ def plan_contact_birthdays(
                 summary["classification_evidence"]["contacts"] += 1
                 morning = datetime.combine(birthday, morning_time, MOSCOW)
                 for rule, advance in (("d3", 3), ("d1", 1), ("d0", 0)):
-                    notify_at = morning - timedelta(days=advance)
+                    notify_at = normalize_notification_time(morning - timedelta(days=advance))
                     if not start <= notify_at < end:
                         continue
                     reminders.append(Reminder(

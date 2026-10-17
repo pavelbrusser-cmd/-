@@ -61,6 +61,27 @@ class PushSchedulerPolicyTests(unittest.TestCase):
             self.assertEqual(scheduler.next_run(moment(), {"next_due_at": due.isoformat()}),
                              moment("12:00:30"))
 
+    def test_night_due_times_wait_for_seven_moscow_while_refresh_continues(self):
+        for due in ('2026-10-15T02:00:00+00:00', '2026-10-15T06:59:59+03:00',
+                    '2026-10-15T07:00:00+03:00'):
+            with self.subTest(due=due):
+                self.assertEqual(scheduler.next_run(moment('06:59:00').astimezone(timezone.utc),
+                                                    {'next_due_at': due}), moment('07:00:00'))
+        self.assertEqual(scheduler.next_run(moment('03:00:00'),
+                                           {'next_due_at': moment('05:00:00').isoformat()}),
+                         moment('03:05:00'))
+        self.assertEqual(scheduler.next_run(moment('07:00:00'),
+                                           {'next_due_at': moment('07:00:00').isoformat()}),
+                         moment('07:00:30'))
+
+    def test_evening_overdue_item_does_not_trigger_thirty_second_night_refreshes(self):
+        self.assertEqual(scheduler.next_run(moment('00:01:00'),
+                                           {'next_due_at': '2026-10-14T23:59:00+03:00'}),
+                         moment('00:06:00'))
+        self.assertEqual(scheduler.next_run(moment('23:59:50'),
+                                           {'next_due_at': moment('23:59:50').isoformat()}),
+                         datetime.fromisoformat('2026-10-16T00:04:50+03:00'))
+
     def test_malformed_due_time_fails_without_echoing_values(self):
         for value in ("private", "2026-10-15T12:00:00", {}, 42, []):
             with self.subTest(value=value), self.assertRaises(scheduler.PushSchedulerError) as error:
@@ -248,6 +269,22 @@ class PushSchedulerProcessTests(unittest.TestCase):
         self.assertEqual(report["activity"], "error")
         self.assertTrue(report["heartbeat_recent"])
         summary.assert_not_called()
+
+    def test_restart_before_seven_refreshes_immediately_and_runs_at_seven(self):
+        stop = AdvancingStop(moment('06:59:00'), moment('07:00:01'))
+        starts = []
+        summaries = [{'next_due_at': '2026-10-15T02:00:00+00:00'}, {'next_due_at': None}]
+
+        def run(**kwargs):
+            starts.append(stop.now)
+            kwargs['heartbeat']()
+            return 0
+
+        with tempfile.TemporaryDirectory() as temporary, patch.object(scheduler, 'run_job', side_effect=run), \
+                patch.object(scheduler, '_queue_summary', side_effect=summaries):
+            scheduler.serve(Path(temporary), stop=stop, clock=lambda: stop.now.astimezone(timezone.utc))
+        self.assertEqual(starts, [moment('06:59:00'), moment('07:00:00')])
+        self.assertTrue(all(delay <= 30 for delay in stop.waits))
 
     def test_queue_read_failure_is_private_and_retried_in_minute(self):
         stop = AdvancingStop(moment(), moment("12:01:01"))
