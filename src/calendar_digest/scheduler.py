@@ -21,7 +21,9 @@ from zoneinfo import ZoneInfo
 
 
 MOSCOW = ZoneInfo("Europe/Moscow")
-PREPARE_TIME = day_time(16, 55)
+# Full-history collection can take 8–10 minutes on the small Render instance.
+# Allow the whole bounded 15-minute job to finish before the 17:00 send time.
+PREPARE_TIME = day_time(16, 40)
 SEND_TIME = day_time(17)
 CUTOFF_TIME = day_time(17, 30)
 RETRY_DELAY = timedelta(minutes=5)
@@ -232,7 +234,7 @@ def serve(directory: Path, *, stop: threading.Event, clock=_now):
                     code = 1
                 if code == TEMPORARY_BUSY_EXIT_CODE:
                     # Another calendar job may be holding the shared lock.
-                    # Poll promptly so a short push sync near 16:55 does not
+                    # Poll promptly so a short push sync near preparation does not
                     # postpone preparation by the full network-error interval.
                     retry_after = clock() + BUSY_RETRY_DELAY
                     print("Календари заняты другой задачей. Повтор проверки через 30 секунд.",
