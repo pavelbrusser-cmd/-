@@ -49,6 +49,38 @@ class DigestEvent:
     timezone_assumed: bool = False
 
 
+@dataclass(frozen=True)
+class SeriesInterval:
+    start: str
+    end: str | None
+    all_day: bool
+
+
+@dataclass(frozen=True)
+class SeriesChangeNotice:
+    """Compare actual day slots without claiming an occurrence-to-occurrence move."""
+
+    source_id: str
+    calendar_id: str
+    calendar_name: str
+    uid: str
+    title: str
+    old_anchor_start: str
+    old_anchor_end: str | None
+    new_anchor_start: str
+    new_anchor_end: str | None
+    old_recurring: bool
+    new_recurring: bool
+    old_intervals: list[SeriesInterval]
+    new_intervals: list[SeriesInterval]
+
+
+@dataclass(frozen=True)
+class SelectionResult:
+    events: list[DigestEvent]
+    series_changes: list[SeriesChangeNotice]
+
+
 @dataclass
 class _Component:
     event: Event
@@ -238,7 +270,7 @@ def _revision(component):
     return sequence, _iso(value)
 
 
-def _read_series(resources, *, only_key=None):
+def _read_series(resources, *, only_key=None, masters_only=False):
     result = {}
     for resource in resources:
         calendar = Calendar.from_ical(resource.data)
@@ -249,6 +281,12 @@ def _read_series(resources, *, only_key=None):
         if len(events) != len(durations):
             raise SelectionError("Календарь содержит некорректную структуру событий.")
         for raw, duration_days in zip(events, durations, strict=True):
+            if masters_only and raw.get("RECURRENCE-ID") is not None:
+                # The legacy per-resource snapshot can mix detached overrides
+                # from different observations. Only master intervals are used
+                # for standalone move history; coherent series history and all
+                # current resources still take the normal, strict path.
+                continue
             component = _normalize(raw, duration_days=duration_days)
             uid = str(component.event["UID"])
             key = (resource.source_id, resource.calendar_id, uid)
@@ -351,7 +389,10 @@ def _iter_series(resources):
 def _previous_masters(resources):
     """History needs intervals, not a second complete iCalendar object graph."""
     result = {}
-    for key, series in _iter_series(resources):
+    for key, group in _group_resources(resources).items():
+        series = _read_series(group, only_key=key, masters_only=True).get(key)
+        if series is None:
+            continue
         master = series.components.get(None)
         if master is not None:
             result[key] = _PreviousMaster(master.start, master.end, _is_recurring(master), master.assumed)
@@ -444,102 +485,189 @@ def _digest(series, component, *, recurring, original_start=None, original_end=N
     )
 
 
+def _select_series_day(series, day_start, day_end, old_master=None):
+    """Select real current instances; historical series anchors are not moves."""
+    selected = []
+    master = series.components.get(None)
+    recurring = _is_recurring(master) or any(rid is not None for rid in series.components)
+    if master is not None and _is_recurring(master):
+        calendar = Calendar()
+        calendar.add_component(deepcopy(master.event))
+        query = recurring_ical_events.of(
+            calendar, keep_recurrence_attributes=True, skip_bad_series=False,
+            components=(recurring_ical_events.ComponentsWithName("VEVENT", series=_UncachedSeries),),
+        )
+        occurrences = query.between(day_start, day_end)
+        # The library's lookback accounts for the master's duration,
+        # but not longer RDATE PERIODs. Query their starts explicitly
+        # rather than expanding an arbitrarily large earlier span.
+        period_starts = set()
+        for prop in _values(master.event, "RDATE"):
+            for item in prop.dts:
+                if not isinstance(item.dt, tuple):
+                    continue
+                begin, finish = item.dt
+                begin = _instant(begin)
+                if begin < day_start and begin not in period_starts and _overlaps(begin, finish, day_start, day_end):
+                    period_starts.add(begin)
+                    occurrences.extend(query.between(begin, begin + timedelta(microseconds=1)))
+        for event in occurrences:
+            occurrence = _normalize(event)
+            occurrence.assumed |= master.assumed
+            if occurrence.rid is not None and _iso(occurrence.rid) in series.components:
+                continue
+            occurrence.end = _original_end(master, occurrence.rid or occurrence.start)
+            if _overlaps(occurrence.start, occurrence.end, day_start, day_end):
+                selected.append(_digest(series, occurrence, recurring=True))
+    elif master is not None:
+        moved = old_master is not None and not old_master.recurring and _iso(master.start) != _iso(old_master.start)
+        if _overlaps(master.start, master.end, day_start, day_end) or (
+            moved and _overlaps(old_master.start, old_master.end, day_start, day_end)
+        ):
+            selected.append(_digest(
+                series, master, recurring=recurring,
+                original_start=old_master.start if moved else None,
+                original_end=old_master.end if moved else None,
+                move_basis="previous_snapshot" if moved else None,
+                assumed_extra=old_master.assumed if moved else False,
+            ))
+    for rid_key, component in series.components.items():
+        if rid_key is None:
+            continue
+        original_end = _original_end(master, component.rid)
+        if component.inferred_start and "DTEND" not in component.event and "DURATION" not in component.event and original_end is not None:
+            component.end = original_end
+        moved = _iso(component.rid) != _iso(component.start)
+        if _overlaps(component.start, component.end, day_start, day_end) or (
+            moved and _overlaps(component.rid, original_end, day_start, day_end)
+        ):
+            selected.append(_digest(
+                series, component, recurring=True,
+                original_start=component.rid if moved else None,
+                original_end=original_end if moved else None,
+                move_basis="recurrence_id" if moved else None,
+                assumed_extra=master.assumed if moved and master is not None else False,
+            ))
+    return selected
+
+
+def _distinct_events(selected):
+    # Duplicate resources and duplicate RRULE/RDATE results represent one
+    # instance only within its source and calendar, never across sources.
+    distinct = {}
+    for event in selected:
+        identity = (event.source_id, event.calendar_id, event.uid, event.recurrence_id)
+        if identity in distinct and distinct[identity] != event:
+            raise SelectionError("Обнаружены противоречивые данные одного экземпляра события.")
+        distinct[identity] = event
+    return sorted(distinct.values(), key=lambda event: (
+        not event.all_day, event.start, event.source_id, event.calendar_id,
+        event.uid, event.recurrence_id or "",
+    ))
+
+
+def _day_window(day):
+    if type(day) is not date:
+        raise SelectionError("Для дайджеста нужна календарная дата без времени.")
+    start = datetime.combine(day, time.min, MOSCOW)
+    return start, start + timedelta(days=1)
+
+
+def _select_grouped_day(current_groups, previous, day_start, day_end):
+    selected = []
+    for key, series in _iter_grouped_series(current_groups):
+        selected.extend(_select_series_day(series, day_start, day_end, previous.get(key)))
+    return _distinct_events(selected)
+
+
 def select_day(
     resources: Iterable[CalendarResourceLike], day: date,
     previous_resources: Iterable[CalendarResourceLike] | None = None,
 ) -> list[DigestEvent]:
-    """Include events intersecting the Moscow day, or moved away from that day.
+    """Include current events intersecting the day and explicit moved-away slots.
 
-    Explicit recurrence overrides take precedence over generated occurrences,
-    including when EXDATE also suppresses that slot. Only current resources
-    produce output; missing snapshot records never imply cancellation.
+    Detached RECURRENCE-ID overrides take precedence, including over EXDATE.
+    Historical master DTSTART changes never become instance-level moves. Use
+    select_day_with_changes with coherent history for separate series notices.
+    Missing snapshot records never imply cancellation.
     """
     try:
-        if type(day) is not date:
-            raise SelectionError("Для дайджеста нужна календарная дата без времени.")
-        day_start = datetime.combine(day, time.min, MOSCOW)
-        day_end = day_start + timedelta(days=1)
+        day_start, day_end = _day_window(day)
         current_groups = _group_resources(resources)
         previous = _previous_masters(previous_resources) if previous_resources is not None else {}
-        selected = []
-        for key, series in _iter_grouped_series(current_groups):
-            master = series.components.get(None)
-            old_master = previous.get(key)
-            recurring = _is_recurring(master) or any(rid is not None for rid in series.components)
-            if master is not None and old_master is not None:
-                if (_is_recurring(master) or old_master.recurring) and _iso(master.start) != _iso(old_master.start):
-                    raise SelectionError("Сравнение переноса начала всей повторяющейся серии пока не поддерживается.")
-            if master is not None and _is_recurring(master):
-                calendar = Calendar()
-                calendar.add_component(deepcopy(master.event))
-                query = recurring_ical_events.of(
-                    calendar, keep_recurrence_attributes=True, skip_bad_series=False,
-                    components=(recurring_ical_events.ComponentsWithName("VEVENT", series=_UncachedSeries),),
-                )
-                occurrences = query.between(day_start, day_end)
-                # The library's lookback accounts for the master's duration,
-                # but not longer RDATE PERIODs. Query their starts explicitly
-                # rather than expanding an arbitrarily large earlier span.
-                period_starts = set()
-                for prop in _values(master.event, "RDATE"):
-                    for item in prop.dts:
-                        if not isinstance(item.dt, tuple):
-                            continue
-                        begin, finish = item.dt
-                        begin = _instant(begin)
-                        if begin < day_start and begin not in period_starts and _overlaps(begin, finish, day_start, day_end):
-                            period_starts.add(begin)
-                            occurrences.extend(query.between(begin, begin + timedelta(microseconds=1)))
-                for event in occurrences:
-                    occurrence = _normalize(event)
-                    occurrence.assumed |= master.assumed
-                    if occurrence.rid is not None and _iso(occurrence.rid) in series.components:
-                        continue
-                    occurrence.end = _original_end(master, occurrence.rid or occurrence.start)
-                    if _overlaps(occurrence.start, occurrence.end, day_start, day_end):
-                        selected.append(_digest(series, occurrence, recurring=True))
-            elif master is not None:
-                moved = old_master is not None and not old_master.recurring and _iso(master.start) != _iso(old_master.start)
-                if _overlaps(master.start, master.end, day_start, day_end) or (
-                    moved and _overlaps(old_master.start, old_master.end, day_start, day_end)
-                ):
-                    selected.append(_digest(
-                        series, master, recurring=recurring,
-                        original_start=old_master.start if moved else None,
-                        original_end=old_master.end if moved else None,
-                        move_basis="previous_snapshot" if moved else None,
-                        assumed_extra=old_master.assumed if moved else False,
-                    ))
-            for rid_key, component in series.components.items():
-                if rid_key is None:
-                    continue
-                original_end = _original_end(master, component.rid)
-                if component.inferred_start and "DTEND" not in component.event and "DURATION" not in component.event and original_end is not None:
-                    component.end = original_end
-                moved = _iso(component.rid) != _iso(component.start)
-                if _overlaps(component.start, component.end, day_start, day_end) or (
-                    moved and _overlaps(component.rid, original_end, day_start, day_end)
-                ):
-                    selected.append(_digest(
-                        series, component, recurring=True,
-                        original_start=component.rid if moved else None,
-                        original_end=original_end if moved else None,
-                        move_basis="recurrence_id" if moved else None,
-                        assumed_extra=master.assumed if moved and master is not None else False,
-                    ))
-        # Duplicate resources and duplicate RRULE/RDATE results represent one
-        # instance only within its source and calendar, never across sources.
-        distinct = {}
-        for event in selected:
-            identity = (event.source_id, event.calendar_id, event.uid, event.recurrence_id)
-            if identity in distinct and distinct[identity] != event:
-                raise SelectionError("Обнаружены противоречивые данные одного экземпляра события.")
-            distinct[identity] = event
-        return sorted(distinct.values(), key=lambda event: (
-            not event.all_day, event.start, event.source_id, event.calendar_id,
-            event.uid, event.recurrence_id or "",
-        ))
+        return _select_grouped_day(current_groups, previous, day_start, day_end)
     except SelectionError:
         raise
     except Exception:
         raise SelectionError("Не удалось безопасно разобрать или развернуть события календаря.") from None
+
+
+def _actual_day_intervals(series, day_start, day_end):
+    intervals = set()
+    for event in _distinct_events(_select_series_day(series, day_start, day_end)):
+        # Explicit moved-away rows belong in the digest but are not an actual
+        # slot on this day. Likewise, cancelled slots are not a current schedule.
+        if event.event_status == "CANCELLED":
+            continue
+        parse = date.fromisoformat if event.all_day else datetime.fromisoformat
+        if _overlaps(parse(event.start), parse(event.end), day_start, day_end):
+            intervals.add(SeriesInterval(event.start, event.end, event.all_day))
+    return sorted(intervals, key=lambda value: (value.start, value.end or "", value.all_day))
+
+
+def _series_changes(current_groups, historical_resources, day_start, day_end):
+    if historical_resources is None:
+        return []
+    # Store raw resource references, not a second parsed event graph. Only a
+    # changed UID is expanded at a time, with its coherent old overrides intact.
+    historical_groups = _group_resources(historical_resources)
+    notices = []
+    for key, group in historical_groups.items():
+        if key not in current_groups:
+            continue
+        old_series = _read_series(group, only_key=key)[key]
+        new_series = _read_series(current_groups[key], only_key=key)[key]
+        old, new = old_series.components.get(None), new_series.components.get(None)
+        if old is None or new is None or not (_is_recurring(old) or _is_recurring(new)):
+            continue
+        if _iso(old.start) == _iso(new.start):
+            continue
+        old_intervals = _actual_day_intervals(old_series, day_start, day_end)
+        new_intervals = _actual_day_intervals(new_series, day_start, day_end)
+        if old_intervals == new_intervals:
+            continue
+        notices.append(SeriesChangeNotice(
+            source_id=new_series.source_id, calendar_id=new_series.calendar_id,
+            calendar_name=new_series.calendar_name, uid=new_series.uid,
+            title=str(new.event.get("SUMMARY", "Без названия")),
+            old_anchor_start=_iso(old.start), old_anchor_end=_iso(old.end),
+            new_anchor_start=_iso(new.start), new_anchor_end=_iso(new.end),
+            old_recurring=_is_recurring(old), new_recurring=_is_recurring(new),
+            old_intervals=old_intervals, new_intervals=new_intervals,
+        ))
+    return sorted(notices, key=lambda notice: (notice.source_id, notice.calendar_id, notice.uid))
+
+
+def select_day_with_changes(
+    resources: Iterable[CalendarResourceLike], day: date,
+    previous_resources: Iterable[CalendarResourceLike] | None = None,
+    series_previous_resources: Iterable[CalendarResourceLike] | None = None,
+) -> SelectionResult:
+    """Select events and independently compare complete historical series.
+
+    Legacy per-resource move history cannot prove the full old recurrence set;
+    only explicitly supplied coherent series history produces exact notices.
+    """
+    try:
+        day_start, day_end = _day_window(day)
+        # Register current custom time zones before reading any old resource,
+        # matching select_day's established parsing precedence.
+        current_groups = _group_resources(resources)
+        previous = _previous_masters(previous_resources) if previous_resources is not None else {}
+        events = _select_grouped_day(current_groups, previous, day_start, day_end)
+        changes = _series_changes(current_groups, series_previous_resources, day_start, day_end)
+        return SelectionResult(events, changes)
+    except SelectionError:
+        raise
+    except Exception:
+        raise SelectionError("Не удалось безопасно сравнить расписание повторяющихся событий.") from None

@@ -5,7 +5,7 @@ from datetime import date, datetime, timedelta
 from html import escape
 
 from .presentation import CATEGORY_LABELS, actions_for, classify_event
-from .selection import DigestEvent
+from .selection import DigestEvent, SeriesChangeNotice
 
 
 INK = "#244f59"
@@ -137,6 +137,42 @@ style="width:100%;margin:0 0 12px;border:1px solid {border};border-radius:10px;b
 </td></tr></table>'''
 
 
+def _series_side(notice: SeriesChangeNotice, side: str, heading: str) -> str:
+    intervals = getattr(notice, f"{side}_intervals")
+    values = [
+        _range(interval.start, interval.end, include_year=True) + (" · весь день" if interval.all_day else "")
+        for interval in intervals
+    ]
+    rendered = "<br>".join(_text(value) for value in values) if values else "На этот день событий нет."
+    recurring = getattr(notice, f"{side}_recurring")
+    anchor = getattr(notice, f"{side}_anchor_start")
+    anchor_label = "Начало серии" if recurring else "Начало события"
+    anchor_value = _moment(anchor, include_year=True) + (" · весь день" if "T" not in anchor else "")
+    return (
+        '<div style="margin-top:13px;padding:12px 14px;background:#f3f6f3;border-radius:6px;'
+        'font-size:13px;line-height:21px;">'
+        f'<strong style="color:{INK};">{heading}</strong><br>{rendered}'
+        f'<div style="margin-top:7px;font-size:11px;line-height:18px;color:#718188;">'
+        f'{anchor_label}: {_text(anchor_value)}</div></div>'
+    )
+
+
+def _series_card(notice: SeriesChangeNotice) -> str:
+    source = f"{SOURCE_NAMES.get(notice.source_id, notice.source_id)} / {notice.calendar_name}"
+    return (
+        '<div class="series-change-card" style="margin:0 0 12px;padding:18px 21px;'
+        'border:1px solid #dfe8e5;border-radius:10px;background:#ffffff;'
+        'page-break-inside:avoid;break-inside:avoid;">'
+        f'{_badge("Изменение расписания", "#fff4dd", "#865e1b")}'
+        f'<h3 style="margin:3px 0 9px;font-size:16px;line-height:24px;font-weight:600;'
+        f'color:{INK};overflow-wrap:anywhere;word-break:break-word;">{_text(notice.title or "Без названия")}</h3>'
+        f'<div style="font-size:11px;line-height:18px;color:#718188;">{_text(source)}</div>'
+        + _series_side(notice, "old", "В сохранённом расписании")
+        + _series_side(notice, "new", "Сейчас")
+        + '</div>'
+    )
+
+
 DEMO = r'''
 <dialog id="action-dialog" aria-labelledby="dialog-heading">
   <form id="action-form">
@@ -216,7 +252,9 @@ DEMO = r'''
 </script>'''
 
 
-def render_email_html(events: list[DigestEvent], day: date, *, interactive=False, first_snapshot=False, action_links=None) -> str:
+def render_email_html(events: list[DigestEvent], day: date, *, interactive=False, first_snapshot=False,
+                      action_links=None, series_changes=()) -> str:
+    series_changes = list(series_changes)
     if action_links is not None:
         interactive = False
     counts = Counter(classify_event(event) for event in events)
@@ -241,6 +279,16 @@ def render_email_html(events: list[DigestEvent], day: date, *, interactive=False
                         f'{heading} <span style="font-size:13px;font-weight:400;color:#81938e;">· {len(group)}</span></h2>{cards}')
     if not events:
         sections.append(f'<p style="padding:30px 0;color:{INK};line-height:25px;">На этот день событий нет.</p>')
+    if series_changes:
+        sections.append(
+            f'<section class="series-changes"><h2 class="section-heading" style="margin:30px 0 14px;'
+            f'font-size:20px;line-height:28px;font-weight:600;color:{INK};">'
+            f'Изменения повторяющихся событий <span style="font-size:13px;font-weight:400;'
+            f'color:#81938e;">· {len(series_changes)}</span></h2>'
+            '<p style="margin:0 0 14px;font-size:12px;line-height:20px;color:#64777b;">'
+            'Интервалы на этот день показаны отдельно для сохранённого и текущего расписания.</p>'
+            + "".join(_series_card(notice) for notice in series_changes) + '</section>'
+        )
     first_note = ('<p style="margin:12px 0 0;">Прежнее время одиночных событий отслеживается с первого сохранённого снимка.</p>'
                   if first_snapshot else "")
     instructions = ('Нажмите на кнопку у события, чтобы посмотреть подтверждение или выбрать новое время. '

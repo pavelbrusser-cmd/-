@@ -50,7 +50,8 @@ class PreviewProgressTests(unittest.TestCase):
                 patch.object(preview, "read_snapshot", side_effect=guarded(preview.read_snapshot, PreviewStage.READ_STATE)),
                 patch.object(preview, "collect_all", side_effect=guarded(collection, PreviewStage.COLLECT)),
                 patch.object(preview, "advance_snapshot", side_effect=guarded(preview.advance_snapshot, PreviewStage.COMPARE)),
-                patch.object(preview, "select_day", side_effect=guarded(preview.select_day, PreviewStage.SELECT)),
+                patch.object(preview, "select_day_with_changes",
+                             side_effect=guarded(preview.select_day_with_changes, PreviewStage.SELECT)),
                 patch.object(preview, "render_markdown", side_effect=guarded(preview.render_markdown, PreviewStage.RENDER)),
                 patch.object(preview, "write_private", side_effect=guarded(preview.write_private, PreviewStage.SAVE)),
             ):
