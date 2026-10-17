@@ -14,6 +14,7 @@ from .event_actions import EventTarget
 from .local_state import write_private
 from .presentation import actions_for
 from .selection import DigestEvent
+from .series_changes import parse_series_changes
 
 
 def public_url(value):
@@ -31,9 +32,10 @@ def public_url(value):
 
 
 def compose_action_email(day: date, events, *, first_snapshot=False,
-                         state_dir=None, base_url=None, signing_key=None):
+                         state_dir=None, base_url=None, signing_key=None, series_changes=()):
     """Build HTML from one captured selection without reading mutable outputs."""
     events = list(events)
+    series_changes = list(series_changes)
     base = public_url(base_url or os.environ.get('DIGEST_PUBLIC_URL') or os.environ.get('RENDER_EXTERNAL_URL', ''))
     key = signing_key or os.environ.get('DIGEST_ACTION_SECRET', '')
     store = ActionStore(Path(state_dir or os.environ.get('DIGEST_STATE_DIR', '.local')) / 'actions.sqlite3', key)
@@ -44,8 +46,10 @@ def compose_action_email(day: date, events, *, first_snapshot=False,
         for action in actions_for(event):
             token = store.issue(asdict(target), action, digest_event=event)
             links[index, action] = f'{base}/a/{token}'
-    html = render_email_html(events, day, first_snapshot=first_snapshot, action_links=links)
-    return html, {'date': day.isoformat(), 'events': len(events), 'action_links': len(links)}
+    html = render_email_html(events, day, first_snapshot=first_snapshot, action_links=links,
+                             series_changes=series_changes)
+    return html, {'date': day.isoformat(), 'events': len(events), 'action_links': len(links),
+                  'series_changes': len(series_changes)}
 
 
 def issue_email(day: date, directory: Path = Path('.local'), *, state_dir=None, base_url=None, signing_key=None):
@@ -54,12 +58,14 @@ def issue_email(day: date, directory: Path = Path('.local'), *, state_dir=None, 
         if payload['date'] != day.isoformat() or payload['timezone'] != 'Europe/Moscow':
             raise ValueError
         events = [DigestEvent(**item) for item in payload['events']]
+        series_changes = parse_series_changes(payload.get('series_changes', []))
     except Exception:
         raise StoreError('Сначала соберите образец дайджеста за выбранную дату.') from None
     html, result = compose_action_email(
         day, events, first_snapshot=payload.get('first_snapshot', False),
         state_dir=state_dir or os.environ.get('DIGEST_STATE_DIR', directory),
         base_url=base_url, signing_key=signing_key,
+        series_changes=series_changes,
     )
     output = directory / f'email-actions-{day.isoformat()}.html'
     write_private(output, html)

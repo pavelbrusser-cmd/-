@@ -1,13 +1,15 @@
-"""Private snapshots used to remember the previous time of standalone events."""
+"""Private snapshots for standalone moves and coherent former series versions."""
 
-from dataclasses import asdict, dataclass
+from copy import deepcopy
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
 import tempfile
 
-from icalendar import Calendar
+from icalendar import Calendar, vText
+from icalendar.parser import Contentlines
 import ijson
 
 from .calendar_collection import CalendarResource
@@ -17,10 +19,15 @@ class StateError(Exception):
     """An unreadable baseline must never silently become a first run."""
 
 
+MAX_SNAPSHOT_BYTES = 192 * 1024 * 1024
+MAX_SERIES_HISTORY_BYTES = 30 * 1024 * 1024
+
+
 @dataclass
 class Snapshot:
     current: list[CalendarResource]
     previous: list[CalendarResource]
+    series_previous: list[CalendarResource] = field(default_factory=list)
 
 
 def _metadata(data: str, cache=None) -> tuple:
@@ -29,6 +36,7 @@ def _metadata(data: str, cache=None) -> tuple:
     events = Calendar.from_ical(data).walk("VEVENT")
     identities = set()
     starts = []
+    masters_info = []
     for event in events:
         uid = str(event.get("UID", ""))
         if not uid:
@@ -41,11 +49,16 @@ def _metadata(data: str, cache=None) -> tuple:
         if isinstance(start, datetime) and start.tzinfo is not None:
             start = start.astimezone(timezone.utc)
         starts.append((uid, str(rid), str(start)))
+        if rid is None:
+            masters_info.append((uid, str(start), bool(event.get("RRULE") or event.get("RDATE"))))
     if not identities:
         raise StateError("В снимке найдено событие без UID.")
     # Providers can keep a master and detached overrides in separate resources.
     masters = {identity for identity in identities if identity[1] == "None"}
-    result = tuple(sorted(masters or identities)), tuple(sorted(starts))
+    result = (
+        tuple(sorted(masters or identities)), tuple(sorted(starts)),
+        tuple(sorted(masters_info)), frozenset(uid for uid, _ in identities),
+    )
     if cache is not None:
         cache[data] = result
     return result
@@ -70,6 +83,92 @@ def _index(resources: list[CalendarResource], cache=None) -> dict:
     return index
 
 
+def _series_index(resources, cache):
+    """Keep raw references and compact anchor metadata, not parsed calendars."""
+    groups, masters = {}, {}
+    for resource in _index(resources, cache).values():
+        metadata = _metadata(resource.data, cache)
+        for uid in metadata[3]:
+            groups.setdefault((resource.source_id, resource.calendar_id, uid), []).append(resource)
+        for uid, start, recurring in metadata[2]:
+            key = resource.source_id, resource.calendar_id, uid
+            anchor = start, recurring
+            if key in masters and masters[key] != anchor:
+                raise StateError("В снимке обнаружены противоречивые основные версии серии.")
+            masters[key] = anchor
+    return groups, masters
+
+
+def _scoped_resource(resource, uid, cache):
+    """Split aggregate ICS only when needed; ordinary resources stay byte exact.
+
+    Preserve non-VEVENT components such as VTIMEZONE. Preserve the lexical
+    DURATION too: icalendar otherwise turns PT24H into P1D, which changes the
+    interval across daylight-saving transitions.
+    """
+    if _metadata(resource.data, cache)[3] == {uid}:
+        return resource
+    calendar = Calendar.from_ical(resource.data)
+    durations = []
+    stack = []
+    for line in Contentlines.from_ical(resource.data):
+        if not line:
+            continue
+        name, _, value = line.parts()
+        name = name.upper()
+        if name == "BEGIN":
+            stack.append(str(value).upper())
+            if stack[-1] == "VEVENT":
+                durations.append([])
+        elif name == "END":
+            if not stack or stack.pop() != str(value).upper():
+                raise StateError("В снимке обнаружена некорректная структура календаря.")
+        elif name == "DURATION" and stack and stack[-1] == "VEVENT":
+            durations[-1].append(str(value))
+    if stack:
+        raise StateError("В снимке обнаружена некорректная структура календаря.")
+    for event, values in zip(calendar.walk("VEVENT"), durations, strict=True):
+        if values:
+            original = event["DURATION"]
+            originals = original if isinstance(original, list) else [original]
+            restored = []
+            for value, prop in zip(values, originals, strict=True):
+                duration = vText(value)
+                duration.params = deepcopy(prop.params)
+                restored.append(duration)
+            event["DURATION"] = restored if isinstance(original, list) else restored[0]
+    calendar.subcomponents = [
+        component for component in calendar.subcomponents
+        if component.name != "VEVENT" or str(component.get("UID", "")) == uid
+    ]
+    scoped = replace(resource, data=calendar.to_ical().decode("utf-8"))
+    if _metadata(scoped.data, cache)[3] != {uid}:
+        raise StateError("Не удалось выделить полную прежнюю версию серии.")
+    return scoped
+
+
+def _advance_series_history(resources, old, cache):
+    current, current_masters = _series_index(resources, cache)
+    latest, latest_masters = _series_index(old.current, cache)
+    remembered, _ = _series_index(old.series_previous, cache)
+    result = []
+    total_bytes = 0
+    for key in current:
+        before, after = latest_masters.get(key), current_masters.get(key)
+        changed = (before is not None and after is not None and before[0] != after[0]
+                   and (before[1] or after[1]))
+        # Capture from one complete observed inventory. Never reconstruct a
+        # former series from ordinary previous records of different vintages.
+        group = latest.get(key, ()) if changed else remembered.get(key, ())
+        for resource in group:
+            scoped = _scoped_resource(resource, key[2], cache)
+            total_bytes += len(scoped.data.encode("utf-8"))
+            if total_bytes > MAX_SERIES_HISTORY_BYTES:
+                raise StateError("История серий превышает допустимый размер; прежний снимок сохранён.")
+            result.append(scoped)
+    return result
+
+
 def advance_snapshot(resources: list[CalendarResource], old: Snapshot) -> Snapshot:
     """Retain the last different start across repeated reads of an unchanged event."""
     cache = {}
@@ -85,7 +184,10 @@ def advance_snapshot(resources: list[CalendarResource], old: Snapshot) -> Snapsh
             previous.append(last)
         else:
             previous.append(remembered.get(key, last))
-    return Snapshot(current=resources, previous=previous)
+    return Snapshot(
+        current=resources, previous=previous,
+        series_previous=_advance_series_history(resources, old, cache),
+    )
 
 
 def _stream_snapshot(stream) -> Snapshot:
@@ -100,6 +202,7 @@ def _stream_snapshot(stream) -> Snapshot:
 
     expect("", "start_map")
     seen = set()
+    schema_version = None
     resources = {}
     fields = {"source_id", "calendar_id", "calendar_name", "data"}
     while True:
@@ -109,11 +212,12 @@ def _stream_snapshot(stream) -> Snapshot:
         if token[:2] != ("", "map_key"):
             raise ValueError("invalid snapshot key")
         name = token[2]
-        if name not in {"schema_version", "current", "previous"} or name in seen:
+        if name not in {"schema_version", "current", "previous", "series_previous"} or name in seen:
             raise ValueError("unknown or duplicate snapshot key")
         seen.add(name)
         if name == "schema_version":
-            if expect(name, "number") != 1:
+            schema_version = expect(name, "number")
+            if type(schema_version) is not int or schema_version not in {1, 2}:
                 raise ValueError("unknown snapshot version")
             continue
         expect(name, "start_array")
@@ -139,23 +243,33 @@ def _stream_snapshot(stream) -> Snapshot:
             if set(item) != fields:
                 raise ValueError("incomplete snapshot resource")
             resources[name].append(CalendarResource(**item, account_email=""))
-    if seen != {"schema_version", "current", "previous"} or next(tokens, None) is not None:
+    required = {"schema_version", "current", "previous"}
+    if schema_version == 2:
+        required.add("series_previous")
+    if seen != required or next(tokens, None) is not None:
         raise ValueError("incomplete snapshot or trailing data")
-    return Snapshot(resources["current"], resources["previous"])
+    return Snapshot(resources["current"], resources["previous"], resources.get("series_previous", []))
 
 
 def read_snapshot(path: Path) -> Snapshot:
     if not path.exists():
         return Snapshot(current=[], previous=[])
     try:
-        # The collector bounds one inventory to 30 MiB; state holds at most two.
-        if path.stat().st_size > 100 * 1024 * 1024:
+        # Three bounded inventories plus JSON escaping. The writer enforces
+        # the same limit before replacement, so it cannot create unreadable state.
+        if path.stat().st_size > MAX_SNAPSHOT_BYTES:
             raise ValueError("oversized snapshot")
         with path.open("rb") as stream:
             state = _stream_snapshot(stream)
         cache = {}
         _index(state.current, cache)
         _index(state.previous, cache)
+        _index(state.series_previous, cache)
+        if any(len(_metadata(item.data, cache)[3]) != 1 for item in state.series_previous):
+            raise ValueError("ambiguous historical series scope")
+        groups, masters = _series_index(state.series_previous, cache)
+        if set(groups) != set(masters):
+            raise ValueError("incomplete historical series")
         return state
     except Exception:
         raise StateError("Локальный снимок календарей повреждён или недоступен; он сохранён без изменений.") from None
@@ -169,10 +283,12 @@ def _snapshot_payload(snapshot: Snapshot) -> dict:
     # remains available to advance_snapshot when a later move is detected.
     current_data = {(item.source_id, item.calendar_id, item.data) for item in snapshot.current}
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "current": [encode(resource) for resource in snapshot.current],
         "previous": [encode(resource) for resource in snapshot.previous
                      if (resource.source_id, resource.calendar_id, resource.data) not in current_data],
+        # Unchanged detached overrides are still essential to the old series.
+        "series_previous": [encode(resource) for resource in snapshot.series_previous],
     }
 
 
@@ -189,6 +305,8 @@ def write_snapshot(path: Path, snapshot: Snapshot) -> None:
             json.dump(payload, stream, ensure_ascii=False)
             stream.flush()
             os.fsync(stream.fileno())
+            if stream.tell() > MAX_SNAPSHOT_BYTES:
+                raise StateError("Снимок календарей превышает допустимый размер; прежний файл сохранён.")
         os.replace(temporary, path)
     finally:
         if os.path.exists(temporary):

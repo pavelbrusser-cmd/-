@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 import recurring_ical_events
 
-from calendar_digest.selection import SelectionError, select_day
+from calendar_digest.selection import SelectionError, SeriesInterval, select_day, select_day_with_changes
 
 
 DAY = date(2026, 10, 14)
@@ -347,15 +347,16 @@ class SelectionTests(unittest.TestCase):
                 for rule in series.recurrence.rrules[1:]:
                     self.assertIsNone(rule._cache)
 
-    def test_unsupported_range_and_whole_series_move_fail_explicitly(self):
+    def test_unsupported_range_fails_but_changed_series_anchor_keeps_real_instances(self):
         ranged = resource(event("range", "DTSTART:20261014T090000Z",
             "RECURRENCE-ID;RANGE=THISANDFUTURE:20261013T090000Z"))
         with self.assertRaisesRegex(SelectionError, "RANGE"):
             select_day([ranged], DAY)
         old = resource(event("series", "DTSTART:20261012T090000Z", "RRULE:FREQ=DAILY;COUNT=5"))
         new = resource(event("series", "DTSTART:20261012T100000Z", "RRULE:FREQ=DAILY;COUNT=5"))
-        with self.assertRaisesRegex(SelectionError, "всей повторяющейся серии"):
-            select_day([new], DAY, [old])
+        current, = select_day([new], DAY, [old])
+        self.assertEqual(current.start, "2026-10-14T13:00:00+03:00")
+        self.assertIsNone(current.original_start)
 
     def test_malformed_critical_data_fail_safely(self):
         invalid = [
@@ -374,6 +375,222 @@ class SelectionTests(unittest.TestCase):
                 self.assertNotIn(private, str(error.exception))
         with self.assertRaises(SelectionError):
             select_day([], datetime(2026, 10, 14))
+
+
+class SeriesChangeTests(unittest.TestCase):
+    def compare(self, current, old, day=DAY):
+        return select_day_with_changes(iter(current), day, iter(old), iter(old))
+
+    def test_daily_time_change_compares_day_slots_not_series_anchors(self):
+        old = resource(event("series", "DTSTART:20261012T090000Z", "DTEND:20261012T100000Z",
+                             "RRULE:FREQ=DAILY;COUNT=5", "SUMMARY:Old name"))
+        current = resource(event("series", "DTSTART:20261012T100000Z", "DTEND:20261012T120000Z",
+                                 "RRULE:FREQ=DAILY;COUNT=5", "SUMMARY:Current name"))
+        result = self.compare([current], [old])
+        occurrence, = result.events
+        notice, = result.series_changes
+        self.assertIsNone(occurrence.original_start)
+        self.assertIsNone(occurrence.move_basis)
+        self.assertEqual(occurrence.recurrence_id, "2026-10-14T13:00:00+03:00")
+        self.assertEqual(notice.title, "Current name")
+        self.assertEqual(notice.old_anchor_start, "2026-10-12T12:00:00+03:00")
+        self.assertEqual(notice.new_anchor_start, "2026-10-12T13:00:00+03:00")
+        self.assertEqual(notice.old_intervals, [SeriesInterval(
+            "2026-10-14T12:00:00+03:00", "2026-10-14T13:00:00+03:00", False)])
+        self.assertEqual(notice.new_intervals, [SeriesInterval(
+            "2026-10-14T13:00:00+03:00", "2026-10-14T15:00:00+03:00", False)])
+        payload = json.loads(json.dumps(asdict(result)))
+        self.assertEqual(payload["series_changes"][0]["old_intervals"][0]["start"],
+                         "2026-10-14T12:00:00+03:00")
+        self.assertNotIn("old_anchor_start", payload["events"][0])
+
+    def test_weekly_move_away_keeps_notice_without_fabricating_current_event(self):
+        old = resource(event("weekly", "DTSTART:20261011T090000Z", "RRULE:FREQ=WEEKLY;COUNT=4"))
+        current = resource(event("weekly", "DTSTART:20261012T090000Z", "RRULE:FREQ=WEEKLY;COUNT=4"))
+        sunday = self.compare([current], [old], date(2026, 10, 18))
+        self.assertEqual(sunday.events, [])
+        notice, = sunday.series_changes
+        self.assertEqual([value.start for value in notice.old_intervals], ["2026-10-18T12:00:00+03:00"])
+        self.assertEqual(notice.new_intervals, [])
+        monday = self.compare([current], [old], date(2026, 10, 19))
+        self.assertEqual(len(monday.events), 1)
+        notice, = monday.series_changes
+        self.assertEqual(notice.old_intervals, [])
+        self.assertEqual([value.start for value in notice.new_intervals], ["2026-10-19T12:00:00+03:00"])
+
+    def test_changed_rules_are_expanded_independently_not_translated_by_anchor_delta(self):
+        old = resource(event("rules", "DTSTART:20261012T090000Z", "RRULE:FREQ=DAILY;COUNT=5"))
+        current = resource(event("rules", "DTSTART:20261013T090000Z",
+                                 "RRULE:FREQ=WEEKLY;BYDAY=TU;COUNT=5"))
+        result = self.compare([current], [old])
+        self.assertEqual(result.events, [])
+        notice, = result.series_changes
+        self.assertEqual([value.start for value in notice.old_intervals], ["2026-10-14T12:00:00+03:00"])
+        self.assertEqual(notice.new_intervals, [])
+
+    def test_nonuniform_rules_with_equal_day_slots_produce_no_false_move(self):
+        cases = (
+            ("20261001T090000Z", "20261002T090000Z", "FREQ=MONTHLY;BYMONTHDAY=14;COUNT=3"),
+            ("20261012T090000Z", "20261013T090000Z", "FREQ=WEEKLY;BYDAY=WE;COUNT=3"),
+            ("20261012T090000Z", "20261013T090000Z", "FREQ=DAILY;COUNT=3"),
+        )
+        for old_start, new_start, rule in cases:
+            with self.subTest(rule=rule):
+                old = resource(event("nonuniform", "DTSTART:" + old_start, "RRULE:" + rule))
+                current = resource(event("nonuniform", "DTSTART:" + new_start, "RRULE:" + rule))
+                result = self.compare([current], [old])
+                self.assertEqual(len(result.events), 1)
+                self.assertEqual(result.events[0].start, "2026-10-14T12:00:00+03:00")
+                self.assertIsNone(result.events[0].original_start)
+                self.assertEqual(result.series_changes, [])
+
+    def test_old_and_current_detached_overrides_take_precedence_over_each_master(self):
+        old_master = resource(event("detached", "DTSTART:20261012T090000Z", "DTEND:20261012T100000Z",
+                                    "RRULE:FREQ=DAILY;COUNT=5", "EXDATE:20261014T090000Z"))
+        old_override = resource(event("detached", "RECURRENCE-ID:20261013T090000Z",
+                                      "DTSTART:20261014T150000Z", "DTEND:20261014T170000Z"))
+        current_master = resource(event("detached", "DTSTART:20261012T100000Z", "DTEND:20261012T110000Z",
+                                        "RRULE:FREQ=DAILY;COUNT=5", "EXDATE:20261014T100000Z"))
+        current_override = resource(event("detached", "RECURRENCE-ID:20261014T100000Z",
+                                          "DTSTART:20261016T150000Z", "DTEND:20261016T160000Z"))
+        result = self.compare([current_master, current_override], [old_master, old_override])
+        moved, = result.events
+        self.assertEqual(moved.start, "2026-10-16T18:00:00+03:00")
+        self.assertEqual(moved.original_start, "2026-10-14T13:00:00+03:00")
+        self.assertEqual(moved.move_basis, "recurrence_id")
+        notice, = result.series_changes
+        self.assertEqual(notice.old_intervals, [SeriesInterval(
+            "2026-10-14T18:00:00+03:00", "2026-10-14T20:00:00+03:00", False)])
+        self.assertEqual(notice.new_intervals, [])
+
+    def test_moved_away_only_rows_are_not_actual_old_or_new_day_slots(self):
+        def moved_series(hour):
+            return resource(
+                event("away", f"DTSTART:20261012T{hour}0000Z", "RRULE:FREQ=DAILY;COUNT=5"),
+                event("away", f"RECURRENCE-ID:20261014T{hour}0000Z", "DTSTART:20261016T150000Z"),
+            )
+        result = self.compare([moved_series("10")], [moved_series("09")])
+        self.assertEqual(len(result.events), 1)
+        self.assertEqual(result.events[0].move_basis, "recurrence_id")
+        self.assertEqual(result.series_changes, [])
+
+    def test_explicit_cancelled_override_stays_in_digest_but_is_not_active_day_slot(self):
+        old = resource(event("cancelled", "DTSTART:20261012T090000Z", "DTEND:20261012T100000Z",
+                             "RRULE:FREQ=DAILY;COUNT=5"))
+        current = resource(
+            event("cancelled", "DTSTART:20261012T100000Z", "DTEND:20261012T110000Z",
+                  "RRULE:FREQ=DAILY;COUNT=5", "EXDATE:20261014T100000Z"),
+            event("cancelled", "RECURRENCE-ID:20261014T100000Z", "STATUS:CANCELLED"),
+        )
+        result = self.compare([current], [old])
+        cancelled, = result.events
+        self.assertEqual(cancelled.event_status, "CANCELLED")
+        notice, = result.series_changes
+        self.assertEqual(len(notice.old_intervals), 1)
+        self.assertEqual(notice.new_intervals, [])
+
+    def test_rdate_period_overlap_retains_real_old_and_new_duration(self):
+        old = resource(event("period", "DTSTART:20261001T090000Z", "DTEND:20261001T100000Z",
+                             "RDATE;VALUE=PERIOD:20261013T090000Z/20261015T100000Z"))
+        current = resource(event("period", "DTSTART:20261002T090000Z", "DTEND:20261002T100000Z",
+                                 "RDATE;VALUE=PERIOD:20261014T100000Z/20261016T120000Z"))
+        result = self.compare([current], [old])
+        notice, = result.series_changes
+        self.assertEqual(notice.old_intervals, [SeriesInterval(
+            "2026-10-13T12:00:00+03:00", "2026-10-15T13:00:00+03:00", False)])
+        self.assertEqual(notice.new_intervals, [SeriesInterval(
+            "2026-10-14T13:00:00+03:00", "2026-10-16T15:00:00+03:00", False)])
+
+    def test_all_day_multiday_overlap_and_date_datetime_conversion(self):
+        old = resource(event("dates", "DTSTART;VALUE=DATE:20261013", "DTEND;VALUE=DATE:20261016",
+                             "RRULE:FREQ=WEEKLY;COUNT=3"))
+        current = resource(event("dates", "DTSTART:20261014T090000Z", "DTEND:20261014T100000Z",
+                                 "RRULE:FREQ=WEEKLY;COUNT=3"))
+        for before, after in ((old, current), (current, old)):
+            with self.subTest(reversed=before is current):
+                result = self.compare([after], [before])
+                self.assertEqual(len(result.events), 1)
+                notice, = result.series_changes
+                self.assertNotEqual(notice.old_intervals[0].all_day, notice.new_intervals[0].all_day)
+                interval = (notice.old_intervals if before is old else notice.new_intervals)[0]
+                self.assertEqual(interval, SeriesInterval("2026-10-13", "2026-10-16", True))
+
+    def test_conversion_between_recurring_and_single_uses_separate_notice(self):
+        repeating = resource(event("conversion", "DTSTART:20261012T090000Z", "RRULE:FREQ=DAILY;COUNT=5"))
+        single = resource(event("conversion", "DTSTART:20261014T100000Z"))
+        for before, after in ((repeating, single), (single, repeating)):
+            with self.subTest(to_single=after is single):
+                result = self.compare([after], [before])
+                current, = result.events
+                self.assertIsNone(current.original_start)
+                notice, = result.series_changes
+                self.assertEqual((notice.old_recurring, notice.new_recurring),
+                                 (before is repeating, after is repeating))
+                self.assertEqual((len(notice.old_intervals), len(notice.new_intervals)), (1, 1))
+
+    def test_irrelevant_anchor_change_and_deleted_series_do_not_create_notices(self):
+        old = resource(event("historical", "DTSTART:20000101T090000Z", "RRULE:FREQ=DAILY;COUNT=2"))
+        current = resource(event("historical", "DTSTART:20000101T100000Z", "RRULE:FREQ=DAILY;COUNT=2"))
+        other = resource(event("today", "DTSTART:20261014T090000Z"))
+        result = self.compare([current, other], [old])
+        self.assertEqual([item.uid for item in result.events], ["today"])
+        self.assertEqual(result.series_changes, [])
+        deleted = self.compare([other], [old])
+        self.assertEqual(deleted.series_changes, [])
+
+    def test_legacy_history_does_not_claim_coherent_old_series_intervals(self):
+        old = resource(event("legacy", "DTSTART:20261012T090000Z", "RRULE:FREQ=DAILY;COUNT=5"))
+        current = resource(event("legacy", "DTSTART:20261012T100000Z", "RRULE:FREQ=DAILY;COUNT=5"))
+        result = select_day_with_changes([current], DAY, [old])
+        self.assertEqual(len(result.events), 1)
+        self.assertEqual(result.series_changes, [])
+        self.assertIsNone(result.events[0].original_start)
+
+    def test_legacy_mixed_detached_versions_do_not_poison_coherent_series_comparison(self):
+        old_master = event("mixed", "DTSTART:20261012T090000Z", "RRULE:FREQ=DAILY;COUNT=5")
+        old_override = event("mixed", "RECURRENCE-ID:20261014T090000Z", "DTSTART:20261014T100000Z")
+        old = resource(old_master, old_override)
+        middle_override = resource(event("mixed", "RECURRENCE-ID:20261014T090000Z",
+                                          "DTSTART:20261014T110000Z"))
+        current = [
+            resource(event("mixed", "DTSTART:20261012T100000Z", "RRULE:FREQ=DAILY;COUNT=5")),
+            resource(event("mixed", "RECURRENCE-ID:20261014T090000Z", "DTSTART:20261014T120000Z")),
+        ]
+        result = select_day_with_changes(current, DAY, [old, middle_override], [old])
+        self.assertEqual({value.start for value in result.events},
+                         {"2026-10-14T13:00:00+03:00", "2026-10-14T15:00:00+03:00"})
+        notice, = result.series_changes
+        self.assertEqual([value.start for value in notice.old_intervals], ["2026-10-14T13:00:00+03:00"])
+        self.assertEqual([value.start for value in notice.new_intervals],
+                         ["2026-10-14T13:00:00+03:00", "2026-10-14T15:00:00+03:00"])
+        # The same conflict remains invalid when claimed to be coherent source
+        # data rather than the explicitly weaker legacy per-resource history.
+        with self.assertRaises(SelectionError):
+            select_day_with_changes(current, DAY, [], [old, middle_override])
+        with self.assertRaises(SelectionError):
+            select_day([old, middle_override], DAY)
+
+    def test_history_scope_and_conflicting_versions_are_not_merged(self):
+        old = resource(event("scope", "DTSTART:20261012T090000Z", "RRULE:FREQ=DAILY;COUNT=5"))
+        current = resource(event("scope", "DTSTART:20261012T100000Z", "RRULE:FREQ=DAILY;COUNT=5"))
+        foreign = replace(old, calendar_id="another-calendar")
+        self.assertEqual(self.compare([current], [foreign]).series_changes, [])
+        conflict = resource(event("scope", "DTSTART:20261012T090000Z", "RRULE:FREQ=DAILY;COUNT=4"))
+        with self.assertRaises(SelectionError):
+            self.compare([current], [old, conflict])
+
+    def test_series_history_does_not_retain_all_parsed_event_graphs(self):
+        rows = [resource(event(str(index), "DTSTART:20200101T090000Z", "RRULE:FREQ=DAILY;COUNT=2",
+                               "DESCRIPTION:" + "synthetic " * 700)) for index in range(240)]
+        tracemalloc.start()
+        try:
+            result = self.compare(rows, rows)
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertEqual(result.events, [])
+        self.assertEqual(result.series_changes, [])
+        self.assertLess(peak, 2 * 1024 * 1024)
 
 
 if __name__ == "__main__":

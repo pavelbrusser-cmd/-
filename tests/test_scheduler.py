@@ -16,7 +16,8 @@ from calendar_digest import scheduler
 
 
 def moment(clock, day="2026-10-14"):
-    return datetime.fromisoformat(f"{day}T{clock}:00+03:00")
+    clock = clock if len(clock) == 8 else clock + ":00"
+    return datetime.fromisoformat(f"{day}T{clock}+03:00")
 
 
 def row(state, *, retryable=False, day="2026-10-15", kind="daily"):
@@ -25,9 +26,9 @@ def row(state, *, retryable=False, day="2026-10-15", kind="daily"):
 
 class SchedulerPolicyTests(unittest.TestCase):
     def test_prepare_send_and_cutoff_boundaries(self):
-        cases = [("16:54", None, None), ("16:55", None, "prepare-delivery"),
-                 ("16:55", row("ready"), None), ("16:59", row("ready"), None),
-                 ("17:00", row("ready"), "send-ready"), ("17:29", row("ready"), "send-ready"),
+        cases = [("16:39:59", None, None), ("16:40", None, "prepare-delivery"),
+                 ("16:40", row("ready"), None), ("16:59:59", row("ready"), None),
+                 ("17:00", row("ready"), "send-ready"), ("17:29:59", row("ready"), "send-ready"),
                  ("17:30", row("ready"), None), ("17:30", None, None), ("23:59", None, None)]
         for clock, delivery, expected in cases:
             with self.subTest(clock=clock, delivery=delivery):
@@ -110,6 +111,68 @@ class SchedulerPolicyTests(unittest.TestCase):
 
 
 class SchedulerProcessTests(unittest.TestCase):
+    def test_early_preparation_remains_fresh_and_waits_until_seventeen_to_send(self):
+        from calendar_digest import delivery
+        from calendar_digest.smtp_delivery import MailSettings
+
+        # Exercise the real outbox's expiry and before-DATA checks for both the
+        # oldest possible ready message and a complete 15-minute preparation.
+        for duration in (timedelta(0), timedelta(minutes=15)):
+            with self.subTest(preparation_duration=duration):
+                now = moment("16:39:59")
+                stop = Mock()
+                stop.is_set.return_value = False
+                jobs = []
+                submissions = []
+                settings = MailSettings("sender@example.invalid", "synthetic-password",
+                                        "recipient@example.invalid")
+
+                def wait(seconds):
+                    nonlocal now
+                    now += timedelta(seconds=seconds)
+                    self.assertLessEqual(now, moment("17:00"))
+
+                stop.wait.side_effect = wait
+
+                def preview(day, directory, **kwargs):
+                    nonlocal now
+                    now += duration
+                    (directory / f"preview-{day.isoformat()}.json").write_text(json.dumps({
+                        "date": day.isoformat(), "timezone": "Europe/Moscow", "events": [],
+                    }), encoding="utf-8")
+
+                def submit(settings, message, *, before_data):
+                    before_data()
+                    submissions.append(now)
+                    stop.is_set.return_value = True
+
+                def job(command, *, day, directory, timeout, **kwargs):
+                    jobs.append((command, now))
+                    self.assertEqual(timeout, 900)
+                    if command == "prepare-delivery":
+                        result = delivery.prepare_delivery(day, directory)
+                    else:
+                        result = delivery.submit_delivery(day, directory)
+                    return 0 if result["state"] in {"ready", "accepted"} else 1
+
+                with tempfile.TemporaryDirectory() as temporary, \
+                        patch.dict(os.environ, {}, clear=True), \
+                        patch.object(scheduler, "run_job", side_effect=job), \
+                        patch.object(delivery.time, "time", side_effect=lambda: now.timestamp()), \
+                        patch.object(delivery, "_utc_now", side_effect=lambda: now.astimezone(timezone.utc)), \
+                        patch.object(delivery.MailSettings, "from_environment", return_value=settings), \
+                        patch("calendar_digest.preview.create_preview", side_effect=preview), \
+                        patch("calendar_digest.action_links.compose_action_email",
+                              return_value=("<html>Example</html>", {"action_links": 0})), \
+                        patch.object(delivery, "submit_message", side_effect=submit), \
+                        redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                    directory = Path(temporary)
+                    scheduler.serve(directory, stop=stop, clock=lambda: now)
+                    self.assertEqual(delivery.delivery_status(directory)["deliveries"][0]["state"], "accepted")
+                self.assertEqual(jobs, [("prepare-delivery", moment("16:40")),
+                                        ("send-ready", moment("17:00"))])
+                self.assertEqual(submissions, [moment("17:00")])
+
     def test_job_timeout_terminates_then_kills_stuck_child_and_reaps(self):
         process = Mock()
         process.poll.return_value = None
@@ -188,7 +251,7 @@ class SchedulerProcessTests(unittest.TestCase):
             with self.subTest(first_code=first_code):
                 stop = Mock()
                 stop.is_set.return_value = False
-                now = moment("16:55")
+                now = moment("16:40")
                 started = []
 
                 def wait(seconds):
@@ -211,7 +274,7 @@ class SchedulerProcessTests(unittest.TestCase):
                         patch.object(scheduler, "run_job", side_effect=job), \
                         redirect_stdout(StringIO()), redirect_stderr(StringIO()) as stderr:
                     scheduler.serve(Path(temporary), stop=stop, clock=lambda: now)
-                self.assertEqual(started, [moment("16:55"), moment("16:55") + delay])
+                self.assertEqual(started, [moment("16:40"), moment("16:40") + delay])
                 if first_code == 75:
                     self.assertIn("30 секунд", stderr.getvalue())
                 else:

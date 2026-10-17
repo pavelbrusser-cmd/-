@@ -23,6 +23,7 @@ import time
 import uuid
 from zoneinfo import ZoneInfo
 
+from .calendar_operation_lock import CalendarBusy
 from .smtp_delivery import (
     MailSettings, SMTPDeliveryError, SMTPDeliveryUncertain, make_message, submit_message,
 )
@@ -211,7 +212,7 @@ def _locked(directory):
         store = DeliveryStore(directory)
         store.recover()
         yield store
-    except DeliveryError:
+    except (DeliveryError, CalendarBusy):
         raise
     except Exception:
         raise DeliveryError("Не удалось выполнить операцию с журналом отправок.") from None
@@ -263,6 +264,7 @@ def prepare_delivery(day: date, directory: Path, *, kind="daily") -> dict:
             from .action_links import compose_action_email
             from .preview import create_preview
             from .selection import DigestEvent
+            from .series_changes import parse_series_changes
 
             create_preview(day, store.directory,
                            progress=lambda stage: print(stage.value, file=sys.stderr, flush=True))
@@ -275,16 +277,26 @@ def prepare_delivery(day: date, directory: Path, *, kind="daily") -> dict:
             if payload["date"] != day_text or payload["timezone"] != "Europe/Moscow":
                 raise DeliveryError("Дата или часовой пояс дайджеста не совпадают.")
             events = [DigestEvent(**item) for item in payload["events"]]
+            series_changes = parse_series_changes(payload.get("series_changes", []))
             html, summary = compose_action_email(
                 day, events, first_snapshot=bool(payload.get("first_snapshot", False)),
                 state_dir=store.directory,
+                series_changes=series_changes,
             )
             generated_at = _utc_now()
             message = make_message(day, events, html, settings, message_id=row["message_id"],
-                                   generated_at=generated_at, test=kind == "test")
+                                   generated_at=generated_at, test=kind == "test",
+                                   series_changes=series_changes)
             name, digest = _save_message(store.directory, message)
             store.ready(day_text, kind, settings=settings, name=name, digest=digest,
                         generated_at=generated_at, events=len(events), action_links=summary["action_links"])
+        except CalendarBusy:
+            # Keep the durable row retryable and preserve the typed signal all
+            # the way through _locked to the CLI's temporary-busy exit code.
+            # The scheduler can then retry after 30 seconds instead of missing
+            # short gaps between push synchronizations with five-minute waits.
+            store.transition(day_text, kind, "failed", retryable=True)
+            raise
         except Exception as error:
             retryable = getattr(error, "retryable", not isinstance(error, (ValueError, KeyError, TypeError)))
             store.transition(day_text, kind, "failed", retryable=retryable)

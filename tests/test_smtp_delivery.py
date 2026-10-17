@@ -9,7 +9,7 @@ import ssl
 import unittest
 from unittest.mock import patch
 
-from calendar_digest.selection import DigestEvent
+from calendar_digest.selection import DigestEvent, SeriesChangeNotice, SeriesInterval
 from calendar_digest.smtp_delivery import (
     MailSettings, SMTPDeliveryError, SMTPDeliveryUncertain,
     make_message, probe_smtp, submit_message,
@@ -31,6 +31,22 @@ def example(**changes):
                   participation="ACCEPTED", recurring=False, multi_day=False)
     values.update(changes)
     return DigestEvent(**values)
+
+
+def series_notice(**changes):
+    values = dict(
+        source_id="mailru_2", calendar_id="private-calendar-path", calendar_name="График",
+        uid="private-series-uid", title="Изменённая серия",
+        old_anchor_start="2026-09-01T15:00:00+03:00", old_anchor_end="2026-09-01T15:30:00+03:00",
+        new_anchor_start="2026-09-01T16:00:00+03:00", new_anchor_end="2026-09-01T16:30:00+03:00",
+        old_recurring=True, new_recurring=True,
+        old_intervals=[SeriesInterval(start="2026-10-15T15:00:00+03:00",
+                                      end="2026-10-15T15:30:00+03:00", all_day=False)],
+        new_intervals=[SeriesInterval(start="2026-10-15T16:00:00+03:00",
+                                      end="2026-10-15T16:30:00+03:00", all_day=False)],
+    )
+    values.update(changes)
+    return SeriesChangeNotice(**values)
 
 
 class FakeSMTP:
@@ -367,6 +383,61 @@ class MIMEMessageTests(unittest.TestCase):
         self.assertTrue(str(message["Subject"]).startswith("[Проверка] "))
         self.assertIn("На этот день событий нет.", message.get_body("plain").get_content())
         self.assertIn("Проверочное письмо.", message.get_body("plain").get_content())
+        self.assertNotIn("Изменения повторяющихся событий", message.get_body("plain").get_content())
+
+    def test_old_only_series_notice_has_independent_saved_schedule_and_separate_anchor(self):
+        notice = series_notice(new_anchor_start="2026-10-16T16:00:00+03:00",
+                               new_anchor_end="2026-10-16T16:30:00+03:00",
+                               new_recurring=False, new_intervals=[])
+        message = BytesParser(policy=default).parsebytes(self.make(series_changes=(notice,)))
+        plain = message.get_body("plain").get_content().replace("\r\n", "\n")
+        section = plain.split("Изменения повторяющихся событий\n", 1)[1]
+        self.assertIn("Изменённая серия\nMail.ru · 2 / График", section)
+        self.assertIn("Отдельные повторения между списками не сопоставляются.", section)
+        self.assertIn("В сохранённом расписании:\n"
+                      "Начало серии (с повторением): 1 сентября 2026, 15:00–15:30\n"
+                      "На этот день:\n15 октября 2026, 15:00–15:30", section)
+        self.assertIn("Сейчас:\nНачало события (без повторения): 16 октября 2026, 16:00–16:30\n"
+                      "На этот день событий нет.", section)
+        self.assertNotIn("Перенесено", section)
+        self.assertNotIn("Стало:", section)
+        self.assertNotIn("сегодня", section.lower())
+
+    def test_notice_renders_mixed_all_day_and_timed_intervals_without_pairing_them(self):
+        notice = series_notice(
+            old_anchor_start="2026-09-01", old_anchor_end="2026-09-03",
+            old_intervals=[SeriesInterval(start="2026-10-14", end="2026-10-17", all_day=True)],
+            new_intervals=[SeriesInterval(start="2026-10-15T16:00:00+03:00",
+                                          end="2026-10-15T16:30:00+03:00", all_day=False),
+                           SeriesInterval(start="2026-10-15T18:00:00+03:00",
+                                          end="2026-10-15T18:30:00+03:00", all_day=False)],
+        )
+        html = "<html><body>HTML уже сформирован</body></html>\n"
+        message = BytesParser(policy=default).parsebytes(
+            self.make([example(title="Обычная встреча")], html,
+                      series_changes=(item for item in (notice,))))
+        plain = message.get_body("plain").get_content().replace("\r\n", "\n")
+        self.assertLess(plain.index("Обычная встреча"), plain.index("Изменения повторяющихся событий"))
+        self.assertIn("Начало серии (с повторением): 1 сентября 2026 — 2 сентября 2026", plain)
+        self.assertIn("14 октября 2026 — 16 октября 2026 · На весь день", plain)
+        self.assertIn("На этот день:\n15 октября 2026, 16:00–16:30\n15 октября 2026, 18:00–18:30", plain)
+        self.assertEqual(message.get_body("html").get_content().replace("\r\n", "\n"), html)
+
+    def test_notice_metadata_remains_in_body_and_private_identifiers_are_omitted(self):
+        notice = series_notice(title="Заголовок\r\nBcc: unintended@example.test",
+                               calendar_name="Календарь\r\nX-Private-Header: injected")
+        raw = self.make(series_changes=(notice,))
+        message = BytesParser(policy=default).parsebytes(raw)
+        plain = message.get_body("plain").get_content()
+        self.assertIn("Bcc: unintended@example.test", plain)
+        self.assertIn("X-Private-Header: injected", plain)
+        for part in message.walk():
+            self.assertIsNone(part["Bcc"])
+            self.assertIsNone(part["X-Private-Header"])
+        self.assertEqual(str(message["Subject"]), "Ваш календарь на 15 октября 2026")
+        for private in (notice.calendar_id, notice.uid, SETTINGS.password):
+            self.assertNotIn(private, plain)
+            self.assertNotIn(private.encode(), raw)
 
     def test_naive_date_or_injected_message_id_is_rejected(self):
         for arguments in ({"message_id": "<ok@example.test>\r\nBcc: leak@example.test", "generated_at": STAMP},

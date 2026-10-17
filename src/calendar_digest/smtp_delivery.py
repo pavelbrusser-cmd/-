@@ -20,7 +20,7 @@ import ssl
 from typing import TYPE_CHECKING, Callable, Iterable
 
 if TYPE_CHECKING:
-    from .selection import DigestEvent
+    from .selection import DigestEvent, SeriesChangeNotice
 
 
 class SMTPDeliveryError(Exception):
@@ -188,7 +188,8 @@ def _range(start: str, end: str | None) -> str:
     return f"{_moment(start)} — {_moment(end)}"
 
 
-def _plain_text(day: date, events: Iterable[DigestEvent], *, test: bool) -> str:
+def _plain_text(day: date, events: Iterable[DigestEvent], *, test: bool,
+                series_changes: Iterable[SeriesChangeNotice] = ()) -> str:
     from .email_html import PARTICIPATION_LABELS, SOURCE_NAMES, STATUS_LABELS, WEEKDAYS
     from .presentation import CATEGORY_LABELS, classify_event
 
@@ -225,12 +226,40 @@ def _plain_text(day: date, events: Iterable[DigestEvent], *, test: bool) -> str:
             if event.timezone_assumed:
                 lines.append("Часовой пояс не указан; время показано по Москве.")
             lines.append("")
+    notices = list(series_changes)
+    if notices:
+        lines.extend([
+            "Изменения повторяющихся событий", "",
+            "Каждый список показывает расписание на этот день. "
+            "Отдельные повторения между списками не сопоставляются.", "",
+        ])
+        for notice in notices:
+            source = SOURCE_NAMES.get(notice.source_id, notice.source_id)
+            lines.extend([notice.title or "Без названия", f"{source} / {notice.calendar_name}"])
+            for label, start, end, recurring, intervals in (
+                ("В сохранённом расписании", notice.old_anchor_start,
+                 notice.old_anchor_end, notice.old_recurring, notice.old_intervals),
+                ("Сейчас", notice.new_anchor_start, notice.new_anchor_end,
+                 notice.new_recurring, notice.new_intervals),
+            ):
+                lines.append(label + ":")
+                anchor = "Начало серии (с повторением)" if recurring else "Начало события (без повторения)"
+                lines.append(f"{anchor}: {_range(start, end)}")
+                if not intervals:
+                    lines.append("На этот день событий нет.")
+                else:
+                    lines.append("На этот день:")
+                for interval in intervals:
+                    suffix = " · На весь день" if interval.all_day else ""
+                    lines.append(_range(interval.start, interval.end) + suffix)
+            lines.append("")
     lines.append("Кнопки действий доступны в HTML-версии письма.")
     return "\n".join(lines) + "\n"
 
 
 def make_message(day: date, events: Iterable[DigestEvent], html: str, settings: MailSettings,
-                 *, message_id: str, generated_at: datetime, test: bool = False) -> bytes:
+                 *, message_id: str, generated_at: datetime, test: bool = False,
+                 series_changes: Iterable[SeriesChangeNotice] = ()) -> bytes:
     """Build a readable plain alternative and preserve the approved HTML layout."""
     if type(day) is not date or not isinstance(html, str):
         raise SMTPDeliveryError("Не удалось сформировать письмо: некорректные данные дайджеста.")
@@ -245,7 +274,8 @@ def make_message(day: date, events: Iterable[DigestEvent], html: str, settings: 
     message["Subject"] = ("[Проверка] " if test else "") + f"Ваш календарь на {_date_label(day)}"
     message["Date"] = format_datetime(generated_at)
     message["Message-ID"] = message_id
-    message.set_content(_plain_text(day, events, test=test), charset="utf-8", cte="quoted-printable")
+    message.set_content(_plain_text(day, events, test=test, series_changes=series_changes),
+                        charset="utf-8", cte="quoted-printable")
     message.add_alternative(html, subtype="html", charset="utf-8", cte="quoted-printable")
     return message.as_bytes()
 

@@ -15,7 +15,8 @@ from .calendar_collection import collect_all
 from .calendar_operation_lock import calendar_operation_lock
 from .cancellation_archive import merge_cancellations
 from .local_state import advance_snapshot, read_snapshot, write_private, write_snapshot
-from .selection import DigestEvent, select_day
+from .selection import DigestEvent, select_day_with_changes
+from .series_changes import parse_series_changes
 from .email_html import render_email_html
 
 
@@ -70,7 +71,7 @@ def _interval(start: str, end: str | None, *, all_day: bool) -> str:
     return f"{_moment(start)} — {_moment(end)}"
 
 
-def render_markdown(events: list[DigestEvent], day: date, *, first_snapshot: bool) -> str:
+def render_markdown(events: list[DigestEvent], day: date, *, first_snapshot: bool, series_changes=()) -> str:
     lines = [f"# События на {day:%d.%m.%Y}", "", "Время — московское (Europe/Moscow).", ""]
     if not events:
         lines += ["На этот день событий нет.", ""]
@@ -109,6 +110,24 @@ def render_markdown(events: list[DigestEvent], day: date, *, first_snapshot: boo
                 lines += ["Место: " + _text(event.location), ""]
             if event.timezone_assumed:
                 lines += ["В исходном времени не указан часовой пояс; использовано московское время.", ""]
+    series_changes = list(series_changes)
+    if series_changes:
+        lines += ["## Изменения повторяющихся событий", "",
+                  "Интервалы на этот день показаны отдельно для сохранённого и текущего расписания.", ""]
+        for notice in series_changes:
+            lines += [f"### {_text(notice.title or 'Без названия')}", "",
+                      f"Календарь: {_text(notice.source_id)} / {_text(notice.calendar_name)}.", ""]
+            for side, heading in (("old", "В сохранённом расписании"), ("new", "Сейчас")):
+                lines += [f"**{heading}**", ""]
+                intervals = getattr(notice, f"{side}_intervals")
+                if intervals:
+                    for interval in intervals:
+                        lines += [_interval(interval.start, interval.end, all_day=interval.all_day), ""]
+                else:
+                    lines += ["На этот день событий нет.", ""]
+                anchor = getattr(notice, f"{side}_anchor_start")
+                label = "Начало серии" if getattr(notice, f"{side}_recurring") else "Начало события"
+                lines += [f"{label}: {_moment(anchor)}" + (" · весь день" if "T" not in anchor else "") + ".", ""]
     if first_snapshot:
         lines += ["Первый снимок: прежнее время одиночных событий до начала наблюдения неизвестно.", ""]
     return "\n".join(lines)
@@ -144,17 +163,23 @@ def _create_preview(
         snapshot = advance_snapshot(collection.resources, old)
         first_snapshot = not old.current
         _report_progress(progress, PreviewStage.SELECT)
-        events = select_day(collection.resources, day, previous_resources=snapshot.previous)
+        selection = select_day_with_changes(
+            collection.resources, day, previous_resources=snapshot.previous,
+            series_previous_resources=snapshot.series_previous,
+        )
+        events, series_changes = selection.events, selection.series_changes
         events = merge_cancellations(
             events, collection.resources, day, Path(os.environ.get("DIGEST_STATE_DIR", directory)),
         )
         _report_progress(progress, PreviewStage.RENDER)
-        markdown = render_markdown(events, day, first_snapshot=first_snapshot)
-        email_html = render_email_html(events, day, first_snapshot=first_snapshot)
-        interactive_html = render_email_html(events, day, interactive=True, first_snapshot=first_snapshot)
+        markdown = render_markdown(events, day, first_snapshot=first_snapshot, series_changes=series_changes)
+        email_html = render_email_html(events, day, first_snapshot=first_snapshot, series_changes=series_changes)
+        interactive_html = render_email_html(events, day, interactive=True, first_snapshot=first_snapshot,
+                                             series_changes=series_changes)
         payload = {
             "date": day.isoformat(), "timezone": "Europe/Moscow", "first_snapshot": first_snapshot,
             "events": [asdict(event) for event in events],
+            "series_changes": [asdict(notice) for notice in series_changes],
         }
         _report_progress(progress, PreviewStage.SAVE)
         markdown_path = directory / f"preview-{day.isoformat()}.md"
@@ -171,7 +196,8 @@ def _create_preview(
         return {
             "date": day.isoformat(), "timezone": "Europe/Moscow",
             "calendars": collection.calendar_count, "resources": len(collection.resources),
-            "events": len(events), "all_day": sum(event.all_day for event in events),
+            "events": len(events), "series_changes": len(series_changes),
+            "all_day": sum(event.all_day for event in events),
             "moved": sum(bool(event.original_start) for event in events),
             "event_statuses": dict(Counter(event.event_status or "UNSPECIFIED" for event in events)),
             "participation": dict(Counter(event.participation for event in events)),
@@ -189,14 +215,17 @@ def render_saved_preview(day: date, directory: Path = Path(".local")) -> dict:
         if payload["date"] != day.isoformat() or payload["timezone"] != "Europe/Moscow":
             raise ValueError("date or timezone mismatch")
         events = [DigestEvent(**item) for item in payload["events"]]
+        series_changes = parse_series_changes(payload.get("series_changes", []))
         first_snapshot = bool(payload.get("first_snapshot", False))
-        static = render_email_html(events, day, first_snapshot=first_snapshot)
-        interactive = render_email_html(events, day, interactive=True, first_snapshot=first_snapshot)
+        static = render_email_html(events, day, first_snapshot=first_snapshot, series_changes=series_changes)
+        interactive = render_email_html(events, day, interactive=True, first_snapshot=first_snapshot,
+                                        series_changes=series_changes)
     except Exception:
         raise PreviewError("Не удалось прочитать сохранённый образец за выбранную дату.") from None
     email_path = directory / f"email-{day.isoformat()}.html"
     preview_path = directory / f"preview-{day.isoformat()}.html"
     write_private(email_path, static)
     write_private(preview_path, interactive)
-    return {"date": day.isoformat(), "events": len(events), "email_html": str(email_path),
+    return {"date": day.isoformat(), "events": len(events), "series_changes": len(series_changes),
+            "email_html": str(email_path),
             "preview_html": str(preview_path), "calendar_changes": False}
