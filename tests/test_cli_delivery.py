@@ -14,7 +14,9 @@ import unittest
 from unittest.mock import Mock, patch
 
 from calendar_digest.calendar_collection import Collection
+from calendar_digest.calendar_operation_lock import calendar_operation_lock
 from calendar_digest.cli import main
+from calendar_digest.readonly_caldav import CalendarConnectionError
 from test_preview import resource
 
 
@@ -103,6 +105,42 @@ class DeliveryCommandTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertTrue(status['busy'])
         self.assertFalse(status['schedule']['enabled'])
+        self.smtp.data.assert_not_called()
+
+    def test_calendar_gate_contention_returns_75_then_prepares_after_release(self):
+        with patch('calendar_digest.preview.collect_all', return_value=Collection([resource()], 11)) as collect:
+            with calendar_operation_lock(self.directory):
+                code, result, diagnostics = self.command('prepare-delivery', '--date', '2026-10-14')
+                self.assertEqual(code, 75)
+                self.assertIsNone(result)
+                self.assertIn('Календари сейчас обновляются', diagnostics)
+                collect.assert_not_called()
+                self.connection.assert_not_called()
+                code, status, _ = self.command('delivery-status', '--date', '2026-10-14')
+                self.assertEqual(code, 0)
+                self.assertEqual(status['deliveries'][0]['state'], 'failed')
+                self.assertTrue(status['deliveries'][0]['retryable'])
+            code, prepared, _ = self.command('prepare-delivery', '--date', '2026-10-14')
+        self.assertEqual(code, 0)
+        self.assertEqual(prepared['state'], 'ready')
+        self.assertEqual(prepared['kind'], 'daily')
+        collect.assert_called_once()
+        self.connection.assert_not_called()
+        self.smtp.data.assert_not_called()
+
+    def test_calendar_read_failure_keeps_generic_retry_behavior_and_private_details(self):
+        with patch('calendar_digest.preview.collect_all',
+                   side_effect=CalendarConnectionError('private-calendar-diagnostic')):
+            code, result, diagnostics = self.command('prepare-delivery', '--date', '2026-10-14')
+        self.assertEqual(code, 1)
+        self.assertIsNone(result)
+        self.assertNotIn('private-calendar-diagnostic', diagnostics)
+        self.assertIn('Не удалось подготовить новое письмо', diagnostics)
+        code, status, _ = self.command('delivery-status', '--date', '2026-10-14')
+        self.assertEqual(code, 0)
+        self.assertEqual(status['deliveries'][0]['state'], 'failed')
+        self.assertTrue(status['deliveries'][0]['retryable'])
+        self.connection.assert_not_called()
         self.smtp.data.assert_not_called()
 
 
