@@ -67,6 +67,59 @@ def _expected_account(value):
     return expected
 
 
+def _request_error(host, status, raw, *, refresh=False):
+    """Map only known provider codes to static, safe owner diagnostics.
+
+    Google descriptions, messages, links and metadata can contain credentials
+    or private identifiers. Never include them, or unknown codes, in an error.
+    """
+    try:
+        payload = json.loads(raw)
+        error = payload.get("error") if isinstance(payload, dict) else None
+    except (ValueError, UnicodeError):
+        error = None
+    if host == "oauth2.googleapis.com":
+        if status == 429 or 500 <= status <= 599:
+            code, message = "GOOGLE_OAUTH_RETRY", "Google временно не выдаёт разрешение. Начните подключение заново позже."
+        elif error == "invalid_client":
+            code, message = "GOOGLE_OAUTH_INVALID_CLIENT", "Google отклонил OAuth-клиент. Проверьте, что GOOGLE_CLIENT_ID и GOOGLE_CLIENT_SECRET принадлежат одному действующему веб-клиенту."
+        elif error == "invalid_grant":
+            if refresh:
+                code, message = "GOOGLE_OAUTH_RECONNECT", "Google отклонил сохранённое разрешение. Подключите аккаунт заново через настройки сервиса."
+            else:
+                code, message = "GOOGLE_OAUTH_INVALID_GRANT", "Google отклонил код входа. Начните подключение заново через кнопку «Подключить через Google»; прежний код повторно не используется."
+        elif error == "redirect_uri_mismatch":
+            code, message = "GOOGLE_OAUTH_REDIRECT", "Google отклонил адрес возврата. Проверьте Authorized redirect URIs у OAuth-клиента: адрес должен совпадать с указанным на странице подключения сервиса."
+        elif error == "invalid_scope":
+            code, message = "GOOGLE_OAUTH_SCOPE", "Google отклонил запрошенное разрешение на чтение календарей. Проверьте настройки OAuth-приложения."
+        elif error in ("access_denied", "unauthorized_client"):
+            code, message = "GOOGLE_OAUTH_DENIED", "Google запретил этому OAuth-клиенту завершить вход. Проверьте доступ аккаунта к приложению и тип клиента «Веб-приложение»."
+        else:
+            code, message = "GOOGLE_OAUTH_HTTP", "Google отклонил получение разрешения OAuth. Проверьте настройки клиента; подключение не активировано."
+    else:
+        reasons = set()
+        if isinstance(error, dict):
+            for field in ("errors", "details"):
+                entries = error.get(field, [])
+                if isinstance(entries, list):
+                    for item in entries:
+                        if isinstance(item, dict) and isinstance(item.get("reason"), str):
+                            reasons.add(item["reason"])
+        if status == 403 and reasons & {"accessNotConfigured", "SERVICE_DISABLED"}:
+            code, message = "GOOGLE_CALENDAR_API_DISABLED", "Google Calendar API выключен для проекта OAuth-клиента. Включите Google Calendar API именно в этом проекте, затем начните подключение заново."
+        elif status == 403 and reasons & {"insufficientPermissions", "ACCESS_TOKEN_SCOPE_INSUFFICIENT"}:
+            code, message = "GOOGLE_CALENDAR_SCOPE", "Google не разрешил чтение календарей. Подключите аккаунт заново и подтвердите доступ к чтению календарей."
+        elif status == 429 or 500 <= status <= 599 or (status == 403 and reasons & {"rateLimitExceeded", "userRateLimitExceeded", "quotaExceeded", "RATE_LIMIT_EXCEEDED", "QUOTA_EXCEEDED"}):
+            code, message = "GOOGLE_CALENDAR_RETRY", "Google временно ограничил чтение календаря. Повторите подключение позже; сохранённые настройки не изменены."
+        elif status == 401:
+            code, message = "GOOGLE_CALENDAR_AUTH", "Google отклонил токен доступа при чтении календаря. Подключите аккаунт заново через настройки сервиса."
+        elif status == 404:
+            code, message = "GOOGLE_CALENDAR_NOT_FOUND", "Основной календарь Google не найден или недоступен для подключаемого аккаунта."
+        else:
+            code, message = "GOOGLE_CALENDAR_HTTP", "Google отклонил чтение основного календаря после получения разрешения. Проверьте Google Calendar API и разрешения аккаунта."
+    return GoogleAuthError(f"{message} [{code}]")
+
+
 def _json_request(host, path, *, form=None, access_token=None):
     """Fixed-origin HTTPS calls; http.client never follows redirects."""
     connection = None
@@ -83,8 +136,11 @@ def _json_request(host, path, *, form=None, access_token=None):
         connection.request("POST" if form is not None else "GET", path, body=body, headers=headers)
         response = connection.getresponse()
         raw = response.read(_MAX_BYTES + 1)
-        if response.status != 200 or len(raw) > _MAX_BYTES:
-            raise GoogleAuthError("Google не подтвердил доступ к календарю. Проверьте подключение в настройках сервиса.")
+        if len(raw) > _MAX_BYTES:
+            raise GoogleAuthError("Ответ Google превышает допустимый размер. Подключение не изменено. [GOOGLE_RESPONSE_TOO_LARGE]")
+        if response.status != 200:
+            raise _request_error(host, response.status, raw,
+                                 refresh=form is not None and form.get("grant_type") == "refresh_token")
         result = json.loads(raw)
         if not isinstance(result, dict):
             raise ValueError
