@@ -12,7 +12,7 @@ INK = "#244f59"
 MONTHS = ("", "января", "февраля", "марта", "апреля", "мая", "июня", "июля",
           "августа", "сентября", "октября", "ноября", "декабря")
 WEEKDAYS = ("Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье")
-SOURCE_NAMES = {"icloud": "iCloud", "mailru_1": "Mail.ru · 1", "mailru_2": "Mail.ru · 2", "mailru_3": "Mail.ru · 3"}
+SOURCE_NAMES = {"icloud": "iCloud", "mailru_1": "Mail.ru · 1", "mailru_2": "Mail.ru · 2", "mailru_3": "Mail.ru · 3", "google": "Google Календарь"}
 ACTION_LABELS = {"confirm": "Подтвердить", "reschedule": "Перенести", "cancel": "Отменить"}
 STATUS_LABELS = {"CONFIRMED": "Подтверждено", "TENTATIVE": "Предварительно", "CANCELLED": "Отменено"}
 PARTICIPATION_LABELS = {"ACCEPTED": "принято", "TENTATIVE": "предварительно принято",

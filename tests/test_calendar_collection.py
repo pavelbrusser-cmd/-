@@ -58,6 +58,7 @@ def supported_properties(name, kind):
 
 class CalendarCollectionTests(unittest.TestCase):
     def setUp(self):
+        self.enterContext(patch("calendar_digest.calendar_collection.google_enabled", return_value=False))
         environment = {}
         self.accounts = {}
         for source, prefix in (

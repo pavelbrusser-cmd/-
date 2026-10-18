@@ -21,6 +21,7 @@ from test_icloud import dav_response, multistatus, response_for
 
 class CalendarSyncTests(unittest.TestCase):
     def setUp(self):
+        self.enterContext(patch("calendar_digest.calendar_sync.google_enabled", return_value=False))
         environment = {}
         self.accounts = {}
         for source, prefix in (("icloud", "ICLOUD"), ("mailru_1", "MAILRU_1"),

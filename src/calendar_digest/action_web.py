@@ -129,11 +129,12 @@ def create_app(config=None, backend=None):
 
     @app.after_request
     def secure_headers(response):
+        form_action = "'self' https://accounts.google.com" if request.endpoint == 'google_settings' else "'self'"
         response.headers.update({
             'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer',
             'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY',
             'Strict-Transport-Security': 'max-age=31536000',
-            'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+            'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'; form-action " + form_action + "; base-uri 'none'; frame-ancestors 'none'",
         })
         return response
 
@@ -276,4 +277,7 @@ def create_app(config=None, backend=None):
     def http_error(error):
         return page(error.code, heading='Страница недоступна', message='Откройте ссылку из актуального дайджеста.', error=True)
 
+    from .google_connection_web import register_google_connection
+    register_google_connection(app, attempts=attempts, attempts_lock=attempts_lock,
+                               password_digest=password_digest)
     return app

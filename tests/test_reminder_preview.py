@@ -73,7 +73,9 @@ class ReminderPreviewTests(unittest.TestCase):
         self.assertEqual(result["calendars"], 2)
         self.assertEqual(result["resources"], 3)
         self.assertEqual(result["reminders_total"], 7)
-        self.assertEqual(result["by_category"], {"birthdays": 3, "control": 2, "periodic_control": 2})
+        self.assertEqual(result["by_category"], {
+            "birthdays": 3, "control": 2, "periodic_control": 2, "google_events": 0,
+        })
         payload = json.loads(Path(result["preview_json"]).read_text())
         self.assertEqual(payload["schema_version"], 1)
         self.assertEqual(len(payload["reminders"]), 7)

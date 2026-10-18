@@ -317,7 +317,7 @@ class AutomaticPushTests(unittest.TestCase):
         self.changed = 0
         with patch('calendar_digest.push_automation.plan_reminders', wraps=push_automation.plan_reminders) as planner:
             self.prepare()
-            self.assertEqual(self.summary()['policy_version'], '2')
+            self.assertEqual(self.summary()['policy_version'], '3')
             self.now += timedelta(days=1, seconds=1)
             self.prepare()
             self.assertEqual(planner.call_count, 2)
@@ -367,7 +367,7 @@ class AutomaticPushTests(unittest.TestCase):
         with patch('calendar_digest.push_automation.plan_reminders', wraps=push_automation.plan_reminders) as planner:
             migrated = self.run_cycle()
             planner.assert_called_once()
-        self.assertEqual(migrated['queue']['policy_version'], '2')
+        self.assertEqual(migrated['queue']['policy_version'], '3')
         self.assertEqual(migrated['queue']['counts']['expired'], 0)
         self.assertEqual(migrated['queue']['counts']['pending'], 1)
         self.assertEqual(migrated['queue']['next_due_at'], '2026-10-15T04:00:00+00:00')
@@ -397,7 +397,7 @@ class AutomaticPushTests(unittest.TestCase):
         with patch('calendar_digest.push_automation.plan_reminders', wraps=push_automation.plan_reminders) as planner:
             current = self.run_cycle()
             planner.assert_called_once()
-        self.assertEqual(current['queue']['policy_version'], '2')
+        self.assertEqual(current['queue']['policy_version'], '3')
         self.assertEqual(current['accepted'], 0)
         self.assertEqual(current['queue']['counts']['accepted'], 1)
         self.assertEqual(current['queue']['counts']['uncertain'], 1)

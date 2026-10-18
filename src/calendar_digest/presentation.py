@@ -101,6 +101,10 @@ def actions_for(event: DigestEvent) -> tuple[str, ...]:
     Calendar STATUS and the account's ATTENDEE PARTSTAT are separate signals.
     Unknown participation alone does not mean an invitation awaits acceptance.
     """
+    # Google is connected with a read-only OAuth grant. Do not issue links
+    # whose CalDAV action backend cannot execute against that provider.
+    if event.source_id == "google":
+        return ()
     status = (event.event_status or "UNSPECIFIED").strip().upper()
     participation = (event.participation or "UNKNOWN").strip().upper()
     if status == "CANCELLED":

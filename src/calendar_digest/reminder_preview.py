@@ -30,6 +30,7 @@ CATEGORY_LABELS = {
     "birthdays": "Дни рождения",
     "control": "Поручения",
     "periodic_control": "Периодические поручения",
+    "google_events": "События Google",
 }
 RULE_LABELS = {
     "d3": "За 3 дня", "d1": "За 1 день", "d0": "В день события",
@@ -39,6 +40,7 @@ SOURCE_LABELS = {
     "icloud_contacts": "Контакты iCloud",
     "icloud": "iCloud", "mailru_1": "Mail.ru · аккаунт 1",
     "mailru_2": "Mail.ru · аккаунт 2", "mailru_3": "Mail.ru · аккаунт 3",
+    "google": "Google Календарь",
 }
 WEEKDAYS = (
     "понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье",
@@ -139,8 +141,8 @@ h1{{font-size:30px;margin:10px 0}}
 .lead{{font-size:19px;margin:10px 0}}
 .note{{color:#55647a;margin:12px 0 0}}
 .notice{{padding:14px 18px;background:#eaf2ff;border-radius:12px;margin:22px 0;color:#264f84}}
-.statistics{{display:flex;gap:12px;margin:22px 0}}
-.statistics div{{flex:1;background:#fff;border-radius:14px;padding:17px}}
+.statistics{{display:flex;flex-wrap:wrap;gap:12px;margin:22px 0}}
+.statistics div{{flex:1 1 150px;background:#fff;border-radius:14px;padding:17px}}
 .statistics strong{{display:block;color:#24548f;font-size:28px}}
 .statistics span{{font-size:14px;color:#55647a}}
 .day{{margin:25px 0}}
