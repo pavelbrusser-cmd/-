@@ -25,7 +25,7 @@ from .runtime import push_schedule_enabled
 
 CONTROL_SOURCE = "mailru_2"
 MAX_BATCH = 50
-POLICY_VERSION = "2"
+POLICY_VERSION = "3"
 
 
 class PushCycleError(Exception):
@@ -55,7 +55,7 @@ def _plain(value, limit):
 def notification_text(reminder: dict) -> tuple[str, str]:
     """Keep source text plain, bounded, and encrypted by the transport."""
     labels = {"birthdays": "День рождения", "control": "Поручение",
-              "periodic_control": "Периодическое поручение"}
+              "periodic_control": "Периодическое поручение", "google_events": "Событие Google"}
     reasons = {"d3": "за 3 дня", "d1": "за 1 день", "d0": "сегодня",
                "h3": "за 3 часа", "h1": "за 1 час"}
     try:

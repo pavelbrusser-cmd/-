@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "calendar-digest"
 version = "0.1.0"
-description = "Daily email digest from iCloud and Mail.ru calendars"
+description = "Daily digest and push reminders from iCloud, Mail.ru and Google calendars"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [

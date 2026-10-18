@@ -1,4 +1,4 @@
-"""Collect complete VEVENT resources from the four configured accounts.
+"""Collect complete VEVENT resources from every enabled calendar source.
 
 This initial implementation rereads every event resource on every run. Keeping
 the full recurrence sets makes moved-out overrides visible to digest selection;
@@ -22,6 +22,7 @@ from icalendar import Calendar
 
 from .icloud import Credentials, _icloud_client
 from .mailru import MailRuCredentials, _mailru_client
+from .google_auth import google_enabled
 from .readonly_caldav import CalendarConnectionError
 
 
@@ -127,7 +128,8 @@ def collect_all() -> Collection:
     """Fetch all VEVENT calendars, retaining raw masters and overrides.
 
     The agreed selection is all event calendars in iCloud and three separate
-    Mail.ru accounts. Failure in any account aborts the result for all accounts.
+    Mail.ru accounts, plus Google when explicitly enabled. Failure in any
+    account aborts the result for all accounts.
     Account emails are retained only for matching participation status locally.
     """
     resources = []
@@ -197,6 +199,26 @@ def collect_all() -> Collection:
                             records.clear()
                             record = None
                             del records
+            source_id = "google"
+            if google_enabled():
+                # The Google adapter returns complete recurrence sets too. Do
+                # not return the already collected DAV data on an OAuth/API
+                # failure, which would make existing Google events disappear.
+                from .google_calendar import collect_google
+
+                google = collect_google()
+                calendar_count += google.calendar_count
+                for item in google.resources:
+                    if len(resources) >= MAX_RESOURCES:
+                        raise CollectionLimitError("Число записей календарей превышает лимит; сбор остановлен.")
+                    total_bytes += len(item.data.encode("utf-8"))
+                    if total_bytes > MAX_TOTAL_BYTES:
+                        raise CollectionLimitError("Общий объём календарей превышает лимит; сбор остановлен.")
+                    resources.append(CalendarResource(
+                        source_id="google", calendar_id=item.calendar_id,
+                        calendar_name=item.calendar_name, account_email=item.account_email,
+                        data=item.data,
+                    ))
         except CalendarConnectionError:
             raise
         except Exception:

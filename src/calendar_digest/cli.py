@@ -50,6 +50,7 @@ def main(argv: list[str] | None = None) -> int:
     commands.add_parser("probe-smtp", help="Проверить вход на почтовый сервер без отправки письма")
     commands.add_parser("probe-push", help="Проверить настройки Pushover без отправки уведомления")
     commands.add_parser("probe-birthdays", help="Проверить чтение дней рождения iCloud Contacts без вывода имён")
+    commands.add_parser("probe-google", help="Проверить чтение Google Календаря без вывода событий и отправки")
     reminder_preview = commands.add_parser("preview-reminders", help="Показать расписание уведомлений без отправки")
     reminder_preview.add_argument("--date", type=date.fromisoformat, metavar="YYYY-MM-DD",
                                   help="Первый день уведомлений по Москве (по умолчанию сегодня)")
@@ -109,6 +110,14 @@ def main(argv: list[str] | None = None) -> int:
             birthdays = collect_contact_birthdays()
             result = {"icloud_contacts": "ok", "addressbooks": birthdays.addressbooks,
                       "birthdays": len(birthdays.contacts), "sent": False}
+        elif args.command == "probe-google":
+            from .google_auth import google_enabled
+            from .google_calendar import collect_google
+
+            google = collect_google()
+            result = {"google": "ok", "account_verified": True,
+                      "enabled": google_enabled(), "calendars": google.calendar_count,
+                      "resources": len(google.resources), "sent": False}
         elif args.command == "preview-reminders":
             start = args.date or datetime.now(ZoneInfo("Europe/Moscow")).date()
             result = create_reminder_preview(start, args.directory, days=args.days,

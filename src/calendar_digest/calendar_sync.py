@@ -1,9 +1,11 @@
-"""Complete CalDAV metadata inventories with bounded, changed-only downloads.
+"""Complete calendar inventories with bounded, changed-only DAV downloads.
 
 This read-only adapter does not persist anything. A caller must replace its
-cache only after all four accounts succeed. Every calendar is inventoried with
+cache only after every enabled account succeeds. Every DAV calendar is inventoried with
 Depth: 1 PROPFIND; only new or changed ETags require calendar-multiget bodies.
 Response limits apply after receipt, before XML parsing, as in collection.py.
+Google uses a complete bounded snapshot; its stable grouped-resource ETags and
+identities keep unchanged events from causing needless reminder replanning.
 """
 
 from dataclasses import dataclass, field
@@ -20,13 +22,14 @@ from .calendar_collection import (
 )
 from .icloud import Credentials, _icloud_client
 from .mailru import MailRuCredentials, _mailru_client
+from .google_auth import google_enabled
 from .readonly_caldav import CalendarConnectionError
 
 
 _DAV = "{DAV:}"
 _CAL = "{urn:ietf:params:xml:ns:caldav}"
 MULTIGET_BATCH_SIZE = 50
-_SOURCES = {"icloud", "mailru_1", "mailru_2", "mailru_3"}
+_SOURCES = {"icloud", "mailru_1", "mailru_2", "mailru_3", "google"}
 
 
 @dataclass(frozen=True)
@@ -292,6 +295,28 @@ def _key(resource):
     return resource.source_id, resource.calendar_id, resource.href
 
 
+def _validate_google_resource(item):
+    # These are stable synthetic identifiers, not remote URLs to be fetched.
+    # Still validate stored identities and event bodies before comparing a new
+    # snapshot with the cache; a corrupt cache must not imply event deletion.
+    from .google_calendar import valid_google_resource_identity
+
+    if (any(not isinstance(value, str) or not value for value in (
+            item.calendar_id, item.calendar_name, item.href, item.etag, item.data))
+            or not valid_google_resource_identity(item.calendar_id, item.href)):
+        raise _error()
+    try:
+        parsed = Calendar.from_ical(item.data)
+        events = parsed.walk("VEVENT")
+        uids = {str(event.get("UID", "")) for event in events}
+        if (parsed.name != "VCALENDAR" or not events or len(uids) != 1 or "" in uids
+                or any(child.name not in {"VEVENT", "VTIMEZONE"}
+                       for child in parsed.subcomponents)):
+            raise ValueError
+    except Exception:
+        raise _error() from None
+
+
 def _cache(previous):
     if not isinstance(previous, list) or len(previous) > MAX_RESOURCES:
         raise _error()
@@ -308,6 +333,8 @@ def _cache(previous):
         total += len(item.data.encode("utf-8"))
         if total > MAX_TOTAL_BYTES:
             raise CollectionLimitError("Общий объём календарей превышает лимит; обновление остановлено.")
+        if item.source_id == "google":
+            _validate_google_resource(item)
         cache[_key(item)] = item
     return cache
 
@@ -369,7 +396,28 @@ def sync_calendars(previous: list[CachedResource]) -> SyncResult:
                             prior = old.get((source_id, calendar_id, href))
                             data = changed_bodies[href] if href in changed_bodies else prior.data
                             resources.append(CachedResource(source_id, calendar_id, name, href, etag, data))
+            if google_enabled():
+                from .google_calendar import collect_google
+
+                google = collect_google()
+                calendar_count += google.calendar_count
+                for item in google.resources:
+                    if len(resources) >= MAX_RESOURCES:
+                        raise CollectionLimitError("Число записей календарей превышает лимит; обновление остановлено.")
+                    total_bytes += len(item.data.encode("utf-8"))
+                    if total_bytes > MAX_TOTAL_BYTES:
+                        raise CollectionLimitError("Общий объём календарей превышает лимит; обновление остановлено.")
+                    cached = CachedResource("google", item.calendar_id, item.calendar_name,
+                                            item.href, item.etag, item.data)
+                    _validate_google_resource(cached)
+                    resources.append(cached)
+                # This adapter downloads a complete Google snapshot even when
+                # its ETags are unchanged. Report that work separately from
+                # actual changes, which determine whether to replan reminders.
+                fetched += len(google.resources)
             current = {_key(item): item for item in resources}
+            if len(current) != len(resources):
+                raise _error()
             deleted = len(old.keys() - current.keys())
             changed = deleted + sum(old.get(key) != value for key, value in current.items())
             return SyncResult(resources, calendar_count, changed, fetched, deleted)

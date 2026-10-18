@@ -80,6 +80,14 @@ class PresentationTests(unittest.TestCase):
             with self.subTest(participation=participation):
                 self.assertEqual(actions_for(sample(event_status="CANCELLED", participation=participation)), ())
 
+    def test_readonly_google_source_never_offers_calendar_mutations(self):
+        for status in ("CONFIRMED", "TENTATIVE", "CANCELLED", "UNSPECIFIED"):
+            for participation in ("ACCEPTED", "TENTATIVE", "NEEDS-ACTION", "DECLINED", "UNKNOWN"):
+                with self.subTest(status=status, participation=participation):
+                    self.assertEqual(actions_for(sample(
+                        source_id="google", event_status=status, participation=participation,
+                    )), ())
+
     def test_accepted_invitation_gets_reschedule_and_cancel(self):
         for status in ("CONFIRMED", "TENTATIVE", "UNSPECIFIED"):
             with self.subTest(status=status):

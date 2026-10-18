@@ -86,6 +86,15 @@ class ActionLinksTests(unittest.TestCase):
         options.update(overrides)
         return issue_email(DAY, self.directory, **options)
 
+    def test_google_events_render_without_unusable_action_links(self):
+        self.save([event(source_id="google", calendar_name="Основной календарь")])
+        result = self.issue()
+        self.assertEqual(result["events"], 1)
+        self.assertEqual(result["action_links"], 0)
+        markup = Markup(Path(result["email_html"]).read_text())
+        self.assertEqual(markup.action_links, [])
+        self.assertIn("Google Календарь", " ".join(markup.visible))
+
     def test_opaque_links_resolve_to_exact_instance_in_shared_state_database(self):
         timed = event(recurrence_id="2026-10-14T09:00:00+03:00", recurring=True)
         all_day = event(uid="private-all-day-id", title="Задача на день", all_day=True,

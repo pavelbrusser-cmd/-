@@ -158,6 +158,8 @@ def _classification(series, component, control_source):
     evidence = _birthday_evidence(series, component, event.title)
     if evidence:
         return event, "birthdays", evidence
+    if series.source_id == "google":
+        return event, "google_events", ()
     if series.source_id == control_source:
         periodic = _PERIODIC.search(event.title) is not None
         return event, "periodic_control" if periodic else "control", ()
@@ -212,7 +214,7 @@ def _schedule(event, category, morning_time):
     if event.all_day:
         result.append(("d0", morning))
     else:
-        hours = 1 if category == "periodic_control" else 3
+        hours = 1 if category in {"periodic_control", "google_events"} else 3
         result.append((f"h{hours}", start - timedelta(hours=hours)))
     return result
 
@@ -242,6 +244,7 @@ def plan_reminders(
     offsets are calculated before the permanent 07:00 Moscow floor,
     including across midnight. Birthday policy takes priority;
     periodic English title markers override only the selected control source.
+    Other Google events use D−1 and T−1h (D0 morning for all-day events).
     All participation states are retained, while STATUS:CANCELLED is excluded.
 
     Counts describe considered occurrence starts, not the complete inventory:
@@ -258,7 +261,7 @@ def plan_reminders(
             "series_total": 0, "series_without_policy": 0, "candidate_occurrences": 0,
             "cancelled_occurrences": 0, "unclassified_occurrences": 0,
             "timezone_assumed_occurrences": 0, "reminders_total": 0,
-            "by_category": {"birthdays": 0, "control": 0, "periodic_control": 0},
+            "by_category": {"birthdays": 0, "control": 0, "periodic_control": 0, "google_events": 0},
             "by_rule": {"d3": 0, "d1": 0, "d0": 0, "h3": 0, "h1": 0},
             "classification_evidence": {"categories": 0, "calendar_name": 0, "title": 0},
         }

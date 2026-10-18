@@ -93,7 +93,7 @@ def _reminder_row(reminder):
             raise QueueError("Неполное напоминание; расписание не сохранено.")
     if reminder.get("recurrence_id") is not None and not isinstance(reminder["recurrence_id"], str):
         raise QueueError("Некорректное повторение; расписание не сохранено.")
-    if (reminder.get("category") not in {"birthdays", "control", "periodic_control"}
+    if (reminder.get("category") not in {"birthdays", "control", "periodic_control", "google_events"}
             or reminder.get("rule") not in {"d3", "d1", "d0", "h3", "h1"}
             or not isinstance(reminder.get("all_day"), bool)):
         raise QueueError("Некорректное правило; расписание не сохранено.")
