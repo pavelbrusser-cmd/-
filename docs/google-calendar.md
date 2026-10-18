@@ -65,6 +65,27 @@ External / Testing с ограниченным сроком refresh token: дл�
 screen и требования проверки задаются в Google Cloud, не этим сервисом.
 Отозванный или истёкший доступ требует повторного согласия владельца.
 
+Если подключение не завершилось, страница настроек показывает безопасный код
+ошибки и действие для исправления. Основные случаи:
+
+- `GOOGLE_CALENDAR_API_DISABLED`: включите Google Calendar API в том же
+  проекте Google Cloud, где создан Client ID. Кнопка «Enable / Включить» на
+  странице API означает, что API ещё отключён; у включённого API отображается
+  «Manage / Управление».
+- `GOOGLE_OAUTH_INVALID_CLIENT`: проверьте пару Client ID и Client Secret
+  действующего OAuth-клиента типа «Веб-приложение».
+- `GOOGLE_OAUTH_REDIRECT`: исправьте точный Authorized redirect URI у клиента.
+- `GOOGLE_CALENDAR_SCOPE`: при новом входе разрешите чтение календарей.
+- `GOOGLE_OAUTH_INVALID_GRANT` или `GOOGLE_OAUTH_RECONNECT`: начните новое
+  подключение через настройки сервиса.
+- `GOOGLE_OAUTH_RETRY` или `GOOGLE_CALENDAR_RETRY`: повторите попытку позже.
+
+После исправления начинайте подключение заново кнопкой «Подключить через
+Google»: обновление старой страницы callback не повторяет обмен одноразового
+кода. Сообщения сервиса различают получение OAuth-разрешения и проверку
+основного календаря; они не включают исходный ответ Google, токены, ссылки
+из ошибок или идентификаторы проекта.
+
 Альтернативная конфигурация для уже выданного offline grant — защищённые
 переменные `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REFRESH_TOKEN`,
 `GOOGLE_CALENDAR_EMAIL` и `GOOGLE_CALENDAR_ENABLED=true`. Веб-подключению
