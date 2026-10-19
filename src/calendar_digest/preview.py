@@ -2,7 +2,7 @@
 
 from collections import Counter
 from collections.abc import Callable
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import date, datetime, timedelta
 from enum import Enum
 import fcntl
@@ -17,7 +17,7 @@ from .cancellation_archive import merge_cancellations
 from .local_state import advance_snapshot, read_snapshot, write_private, write_snapshot
 from .selection import DigestEvent, select_day_with_changes
 from .series_changes import parse_series_changes
-from .email_html import render_email_html
+from .email_html import SECTIONS, digest_sections, render_email_html
 
 
 class PreviewError(Exception):
@@ -81,15 +81,17 @@ def render_markdown(events: list[DigestEvent], day: date, *, first_snapshot: boo
         "DECLINED": "отклонено", "NEEDS-ACTION": "ожидает ответа",
         "DELEGATED": "делегировано",
     }
-    for all_day, heading in ((True, "На весь день"), (False, "По времени")):
-        group = [event for event in events if event.all_day == all_day]
-        if not group:
-            continue
-        lines += [f"## {heading}", ""]
-        for event in group:
+    for section, group in digest_sections(events):
+        lines += [f"## {SECTIONS[section][0]}", ""]
+        addresses = sorted({event.account_email for _, event in group if event.account_email})
+        if addresses:
+            lines += ["Источники: " + _text(", ".join(addresses)), ""]
+        for _, event in group:
             lines += [f"### {_text(event.title or 'Без названия')}", ""]
             lines += [_interval(event.start, event.end, all_day=event.all_day), ""]
             lines += [f"Календарь: {_text(event.source_id)} / {_text(event.calendar_name)}.", ""]
+            if event.account_email:
+                lines += [f"Аккаунт: {_text(event.account_email)}", ""]
             if event.original_start:
                 original = _interval(event.original_start, event.original_end,
                                      all_day="T" not in event.original_start)
@@ -117,6 +119,8 @@ def render_markdown(events: list[DigestEvent], day: date, *, first_snapshot: boo
         for notice in series_changes:
             lines += [f"### {_text(notice.title or 'Без названия')}", "",
                       f"Календарь: {_text(notice.source_id)} / {_text(notice.calendar_name)}.", ""]
+            if notice.account_email:
+                lines += [f"Аккаунт: {_text(notice.account_email)}", ""]
             for side, heading in (("old", "В сохранённом расписании"), ("new", "Сейчас")):
                 lines += [f"**{heading}**", ""]
                 intervals = getattr(notice, f"{side}_intervals")
@@ -171,6 +175,15 @@ def _create_preview(
         events = merge_cancellations(
             events, collection.resources, day, Path(os.environ.get("DIGEST_STATE_DIR", directory)),
         )
+        accounts = {}
+        for resource in collection.resources:
+            if resource.account_email:
+                accounts.setdefault(resource.source_id, set()).add(resource.account_email)
+        # Old cancellation records predate account labels. Enrich only from a
+        # unique account actually observed in this complete collection.
+        events = [replace(event, account_email=next(iter(accounts[event.source_id])))
+                  if not event.account_email and len(accounts.get(event.source_id, ())) == 1
+                  else event for event in events]
         _report_progress(progress, PreviewStage.RENDER)
         markdown = render_markdown(events, day, first_snapshot=first_snapshot, series_changes=series_changes)
         email_html = render_email_html(events, day, first_snapshot=first_snapshot, series_changes=series_changes)

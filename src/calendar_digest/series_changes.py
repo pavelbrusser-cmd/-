@@ -30,10 +30,11 @@ def _parse_series_changes(values) -> list[SeriesChangeNotice]:
     result = []
     identities = set()
     for value in values:
-        if not isinstance(value, dict) or set(value) != notice_fields:
+        if not isinstance(value, dict) or set(value) not in (notice_fields, notice_fields - {"account_email"}):
             raise ValueError("Некорректная сохранённая заметка об изменении серии.")
         item = dict(value)
-        for name in ("source_id", "calendar_id", "calendar_name", "uid", "title"):
+        item.setdefault("account_email", "")
+        for name in ("source_id", "calendar_id", "calendar_name", "uid", "title", "account_email"):
             if not isinstance(item[name], str):
                 raise ValueError("Некорректные данные изменения серии.")
         identity = item["source_id"], item["calendar_id"], item["uid"]

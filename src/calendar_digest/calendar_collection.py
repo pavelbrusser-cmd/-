@@ -130,7 +130,7 @@ def collect_all() -> Collection:
     The agreed selection is all event calendars in iCloud and three separate
     Mail.ru accounts, plus Google when explicitly enabled. Failure in any
     account aborts the result for all accounts.
-    Account emails are retained only for matching participation status locally.
+    Account emails identify participation locally and label digest sources.
     """
     resources = []
     calendar_count = 0

@@ -47,6 +47,7 @@ class DigestEvent:
     move_basis: str | None = None
     location: str | None = None
     timezone_assumed: bool = False
+    account_email: str = ""
 
 
 @dataclass(frozen=True)
@@ -73,6 +74,7 @@ class SeriesChangeNotice:
     new_recurring: bool
     old_intervals: list[SeriesInterval]
     new_intervals: list[SeriesInterval]
+    account_email: str = ""
 
 
 @dataclass(frozen=True)
@@ -482,6 +484,7 @@ def _digest(series, component, *, recurring, original_start=None, original_end=N
         move_basis=move_basis,
         location=str(event["LOCATION"]) if "LOCATION" in event else None,
         timezone_assumed=component.assumed or assumed_extra,
+        account_email=series.account_email,
     )
 
 
@@ -644,6 +647,7 @@ def _series_changes(current_groups, historical_resources, day_start, day_end):
             new_anchor_start=_iso(new.start), new_anchor_end=_iso(new.end),
             old_recurring=_is_recurring(old), new_recurring=_is_recurring(new),
             old_intervals=old_intervals, new_intervals=new_intervals,
+            account_email=new_series.account_email,
         ))
     return sorted(notices, key=lambda notice: (notice.source_id, notice.calendar_id, notice.uid))
 

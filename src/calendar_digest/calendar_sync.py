@@ -339,19 +339,38 @@ def _cache(previous):
     return cache
 
 
-def sync_calendars(previous: list[CachedResource]) -> SyncResult:
-    """Return a complete replacement cache or fail without any partial result."""
+def sync_calendars(previous: list[CachedResource], *, source_ids=None) -> SyncResult:
+    """Return a complete replacement cache for the selected sources.
+
+    A separate worker may select one source without needing other providers'
+    credentials. Its cache must belong to that exact scope. The default keeps
+    the complete multi-account synchronization used by push notifications.
+    """
     resources = []
     calendar_count = fetched = total_bytes = 0
     seen_calendars = set()
     with _quiet_library_logs():
         try:
+            supported = {"icloud", "mailru_1", "mailru_2", "mailru_3", "google"}
+            if source_ids is None:
+                selected = supported
+            else:
+                if (not isinstance(source_ids, (tuple, list, set, frozenset)) or not source_ids
+                        or any(not isinstance(value, str) for value in source_ids)
+                        or len(set(source_ids)) != len(source_ids)
+                        or not set(source_ids) <= supported):
+                    raise _error()
+                selected = set(source_ids)
+                if any(item.source_id not in selected for item in previous):
+                    raise _error()
             old = _cache(previous)
-            sources = [
-                ("icloud", Credentials.from_environment(), _icloud_client),
-                *[(f"mailru_{number}", MailRuCredentials.from_environment(number), _mailru_client)
-                  for number in (1, 2, 3)],
-            ]
+            sources = []
+            if "icloud" in selected:
+                sources.append(("icloud", Credentials.from_environment(), _icloud_client))
+            for number in (1, 2, 3):
+                source_id = f"mailru_{number}"
+                if source_id in selected:
+                    sources.append((source_id, MailRuCredentials.from_environment(number), _mailru_client))
             for source_id, credentials, connect in sources:
                 with connect(credentials) as client:
                     client.timeout = COLLECTION_TIMEOUT_SECONDS
@@ -396,7 +415,7 @@ def sync_calendars(previous: list[CachedResource]) -> SyncResult:
                             prior = old.get((source_id, calendar_id, href))
                             data = changed_bodies[href] if href in changed_bodies else prior.data
                             resources.append(CachedResource(source_id, calendar_id, name, href, etag, data))
-            if google_enabled():
+            if "google" in selected and google_enabled():
                 from .google_calendar import collect_google
 
                 google = collect_google()
@@ -427,7 +446,16 @@ def sync_calendars(previous: list[CachedResource]) -> SyncResult:
             raise _error() from None
 
 
-def to_calendar_resources(resources: list[CachedResource]) -> list[CalendarResource]:
-    """Push policies include all invitations; account email is unnecessary."""
-    return [CalendarResource(item.source_id, item.calendar_id, item.calendar_name, "", item.data)
+def to_calendar_resources(resources: list[CachedResource], *, account_emails=None) -> list[CalendarResource]:
+    """Attach freshly verified account identities when a caller needs them.
+
+    Push policies include all invitations and continue to use the empty default.
+    Account identities are not inferred from calendar titles or event content.
+    """
+    accounts = {} if account_emails is None else account_emails
+    if not isinstance(accounts, dict) or any(not isinstance(key, str) or not isinstance(value, str)
+                                            for key, value in accounts.items()):
+        raise _error()
+    return [CalendarResource(item.source_id, item.calendar_id, item.calendar_name,
+                             accounts.get(item.source_id, ""), item.data)
             for item in resources]

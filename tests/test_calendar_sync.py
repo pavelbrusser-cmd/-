@@ -125,6 +125,39 @@ class CalendarSyncTests(unittest.TestCase):
         self.assertEqual(self.downloads, [])
         self.assertEqual(len(self.inventories), 8)
 
+    def test_selected_source_is_incremental_without_other_credentials_or_google(self):
+        self.records["mailru_2", "family"] = {"control.ics": ('"v1"', RAW_SERIES)}
+        environment = {key: value for key, value in os.environ.items() if key.startswith("MAILRU_2_")}
+        with patch.dict(os.environ, environment, clear=True), \
+                patch("calendar_digest.calendar_sync.google_enabled", side_effect=AssertionError("unrelated provider")), \
+                patch("calendar_digest.calendar_sync.Credentials.from_environment", side_effect=AssertionError("unrelated credentials")):
+            first = sync_calendars([], source_ids=("mailru_2",))
+            second = sync_calendars(first.resources, source_ids=("mailru_2",))
+            self.assertEqual((first.calendar_count, first.fetched), (1, 1))
+            self.assertEqual((second.changed, second.fetched, second.deleted), (0, 0, 0))
+            self.assertEqual(self.inventories, [("mailru_2", "family"), ("mailru_2", "family")])
+            self.records["mailru_2", "family"].clear()
+            self.assertEqual(sync_calendars(second.resources, source_ids=("mailru_2",)).deleted, 1)
+
+    def test_invalid_or_mixed_scope_never_becomes_an_authoritative_deletion(self):
+        existing = sync_calendars([]).resources
+        self.inventories.clear()
+        for selection in ([], (), "mailru_2", ["unknown"], ["mailru_2", "mailru_2"], [None]):
+            with self.subTest(selection=selection), self.assertRaises(CalendarConnectionError):
+                sync_calendars([], source_ids=selection)
+        with self.assertRaises(CalendarConnectionError):
+            sync_calendars(existing, source_ids=("mailru_2",))
+        self.assertEqual(self.inventories, [])
+
+    def test_account_metadata_is_attached_only_from_explicit_verified_mapping(self):
+        cached = sync_calendars([]).resources
+        self.assertTrue(all(not item.account_email for item in to_calendar_resources(cached)))
+        resources = to_calendar_resources(cached, account_emails={"icloud": "owner@example.invalid"})
+        self.assertEqual(resources[0].account_email, "owner@example.invalid")
+        self.assertEqual(resources[1].account_email, "")
+        with self.assertRaises(CalendarConnectionError):
+            to_calendar_resources(cached, account_emails={"icloud": 123})
+
     def test_empty_propfind_discovery_body_is_allprop_with_real_client(self):
         credentials = MailRuCredentials("fictional-mailru_1@example.invalid", PASSWORD)
         with _mailru_client(credentials) as client:

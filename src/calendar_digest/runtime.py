@@ -36,6 +36,14 @@ def push_schedule_enabled(environment: Mapping[str, str] | None = None) -> bool:
     return value == "true"
 
 
+def control_email_enabled(environment: Mapping[str, str] | None = None) -> bool:
+    environment = os.environ if environment is None else environment
+    value = environment.get("CONTROL_EMAIL_ENABLED", "false")
+    if value not in {"true", "false"}:
+        raise RuntimeConfigurationError("CONTROL_EMAIL_ENABLED должен быть true или false.")
+    return value == "true"
+
+
 def service_port(environment: Mapping[str, str] | None = None) -> int:
     environment = os.environ if environment is None else environment
     value = environment.get("PORT", "10000")
@@ -56,7 +64,7 @@ def validate_smtp_settings():
 
 
 def service_commands(root: Path, *, port: int, enabled: bool,
-                     push_enabled: bool = False) -> list[list[str]]:
+                     push_enabled: bool = False, control_email_enabled: bool = False) -> list[list[str]]:
     commands = [[
         str(root / ".venv/bin/gunicorn"), "calendar_digest.action_web:create_app()",
         "--bind", f"0.0.0.0:{port}", "--workers", "1", "--threads", "4",
@@ -66,6 +74,8 @@ def service_commands(root: Path, *, port: int, enabled: bool,
         commands.append([sys.executable, "-m", "calendar_digest.scheduler"])
     if push_enabled:
         commands.append([sys.executable, "-m", "calendar_digest.push_scheduler"])
+    if control_email_enabled:
+        commands.append([sys.executable, "-m", "calendar_digest.control_email_scheduler"])
     return commands
 
 
@@ -118,6 +128,7 @@ def main() -> int:
     try:
         enabled = schedule_enabled()
         push_enabled = push_schedule_enabled()
+        control_enabled = control_email_enabled()
         port = service_port()
         if enabled:
             validate_smtp_settings()
@@ -138,8 +149,11 @@ def main() -> int:
         root = Path(__file__).resolve().parents[2]
         print("Расписание включено." if enabled else "Расписание выключено.", flush=True)
         print("Push-расписание включено." if push_enabled else "Push-расписание выключено.", flush=True)
+        print("Почтовые напоминания участникам включены." if control_enabled
+              else "Почтовые напоминания участникам выключены.", flush=True)
         return supervise(service_commands(root, port=port, enabled=enabled,
-                                           push_enabled=push_enabled), root=root, stop=stop)
+                                           push_enabled=push_enabled,
+                                           control_email_enabled=control_enabled), root=root, stop=stop)
     finally:
         for signum, handler in old_handlers.items():
             signal.signal(signum, handler)

@@ -27,6 +27,9 @@ services:
       # Configure optional Pushover keys in Render, then verify reminders before enabling.
       - key: PUSH_SCHEDULE_ENABLED
         value: "false"
+      # Optional attendee email reminders for the verified control-calendar account.
+      - key: CONTROL_EMAIL_ENABLED
+        value: "false"
       # Optional read-only iCloud Contacts birthday source; reuses existing iCloud credentials.
       - key: ICLOUD_CONTACT_BIRTHDAYS_ENABLED
         value: "false"
