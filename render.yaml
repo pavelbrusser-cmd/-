@@ -21,18 +21,19 @@ services:
         value: 3.12.14
       - key: DIGEST_STATE_DIR
         value: /var/data
-      # Enable only after a delivered sample and final approval.
+      # Owner-managed runtime switches. For a NEW service enter false initially.
+      # Existing Blueprint syncs must preserve the values chosen in Dashboard.
       - key: DIGEST_SCHEDULE_ENABLED
-        value: "false"
+        sync: false
       # Configure optional Pushover keys in Render, then verify reminders before enabling.
       - key: PUSH_SCHEDULE_ENABLED
-        value: "false"
+        sync: false
       # Optional attendee email reminders for the verified control-calendar account.
       - key: CONTROL_EMAIL_ENABLED
-        value: "false"
+        sync: false
       # Optional read-only iCloud Contacts birthday source; reuses existing iCloud credentials.
       - key: ICLOUD_CONTACT_BIRTHDAYS_ENABLED
-        value: "false"
+        sync: false
       # Render provides RENDER_EXTERNAL_URL; the application uses it as its public URL.
       - key: DIGEST_ACTION_SECRET
         generateValue: true
