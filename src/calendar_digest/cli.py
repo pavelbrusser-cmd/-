@@ -32,6 +32,12 @@ from .push_transport import PushError, PushoverSettings, probe_pushover
 from .push_delivery import PushDeliveryError, push_status, send_push_test
 from .push_automation import PushCycleError, automatic_push_status, prepare_push, run_push_cycle
 from .push_queue import QueueError
+from .control_email_preview import (
+    ControlEmailPreviewError, ControlEmailPreviewStage, create_control_email_preview,
+)
+from .control_email_rules import ControlEmailError
+from .control_email_queue import ControlEmailQueueError
+from .control_email_automation import ControlEmailCycleError
 
 
 def _preview_progress(stage: PreviewStage) -> None:
@@ -41,6 +47,11 @@ def _preview_progress(stage: PreviewStage) -> None:
 
 def _reminder_progress(stage: ReminderPreviewStage) -> None:
     if isinstance(stage, ReminderPreviewStage):
+        print(stage.value, file=sys.stderr, flush=True)
+
+
+def _control_email_progress(stage: ControlEmailPreviewStage) -> None:
+    if isinstance(stage, ControlEmailPreviewStage):
         print(stage.value, file=sys.stderr, flush=True)
 
 
@@ -61,6 +72,13 @@ def main(argv: list[str] | None = None) -> int:
     push_receipts = commands.add_parser("push-status", help="Показать проверочную доставку и состояние автоматических уведомлений")
     push_prepare = commands.add_parser("prepare-push", help="Обновить календари и очередь уведомлений без отправки")
     push_cycle = commands.add_parser("push-cycle", help="Выполнить один цикл включённого расписания push")
+    control_preview = commands.add_parser("preview-control-email", help="Показать будущие письма исполнителям без отправки")
+    control_preview.add_argument("--date", "--start-date", dest="date", type=date.fromisoformat,
+                                 metavar="YYYY-MM-DD", help="Первый день по Москве (по умолчанию сегодня)")
+    control_preview.add_argument("--days", type=int, default=7, help="Период предпросмотра: 1–31 день")
+    control_prepare = commands.add_parser("prepare-control-email", help="Подготовить очередь писем исполнителям без отправки и включения")
+    control_status = commands.add_parser("control-email-status", help="Показать счётчики очереди и состояние расписания писем исполнителям")
+    control_cycle = commands.add_parser("control-email-cycle", help="Внутренняя команда: выполнить цикл включённого расписания писем исполнителям")
     commands.add_parser("discover-icloud", help="Показать доступные календари iCloud")
     mailru = commands.add_parser("discover-mailru", help="Показать доступные календари Mail.ru")
     mailru.add_argument("--account", type=int, choices=(1, 2, 3), default=1,
@@ -88,12 +106,13 @@ def main(argv: list[str] | None = None) -> int:
     for command in (prepare, submit):
         command.add_argument("--kind", choices=("daily", "test"), default="daily")
     for command in (preview, render, actions, prepare, submit, test, status,
-                    reminder_preview, push_test, push_receipts, push_prepare, push_cycle):
+                    reminder_preview, push_test, push_receipts, push_prepare, push_cycle,
+                    control_preview, control_prepare, control_status, control_cycle):
         command.add_argument("--directory", type=Path,
                              default=Path(os.environ.get("DIGEST_STATE_DIR", ".local")),
                              help="Приватная папка данных (по умолчанию DIGEST_STATE_DIR или .local)")
     args = parser.parse_args(argv)
-    if args.command in {"probe-icloud", "probe-mailru", "preview-reminders"} and not 1 <= args.days <= 31:
+    if args.command in {"probe-icloud", "probe-mailru", "preview-reminders", "preview-control-email"} and not 1 <= args.days <= 31:
         parser.error("--days должно быть в диапазоне от 1 до 31")
 
     # Library diagnostics can contain private DAV URLs or server response bodies.
@@ -122,6 +141,23 @@ def main(argv: list[str] | None = None) -> int:
             start = args.date or datetime.now(ZoneInfo("Europe/Moscow")).date()
             result = create_reminder_preview(start, args.directory, days=args.days,
                                              control_source=args.control_source, progress=_reminder_progress)
+        elif args.command == "preview-control-email":
+            start = args.date or datetime.now(ZoneInfo("Europe/Moscow")).date()
+            result = create_control_email_preview(start, args.directory, days=args.days,
+                                                  progress=_control_email_progress)
+        elif args.command in {"prepare-control-email", "control-email-status", "control-email-cycle"}:
+            from .control_email_automation import (
+                automatic_control_email_status, prepare_control_email, run_control_email_cycle,
+            )
+
+            if args.command == "prepare-control-email":
+                print("Готовим очередь писем исполнителям. Отправка и включение расписания не выполняются.",
+                      file=sys.stderr, flush=True)
+                result = prepare_control_email(args.directory)
+            elif args.command == "control-email-status":
+                result = automatic_control_email_status(args.directory)
+            else:
+                result = run_control_email_cycle(args.directory)
         elif args.command == "send-push-test":
             result = send_push_test(args.directory)
         elif args.command == "push-status":
@@ -191,7 +227,8 @@ def main(argv: list[str] | None = None) -> int:
         return 75
     except (CalendarConnectionError, SelectionError, StateError, PreviewError, StoreError,
             CalendarLockError, DeliveryError, SMTPDeliveryError, RuntimeConfigurationError,
-            ReminderPreviewError, PushError, PushDeliveryError, PushCycleError, QueueError) as exc:
+            ReminderPreviewError, PushError, PushDeliveryError, PushCycleError, QueueError,
+            ControlEmailPreviewError, ControlEmailError, ControlEmailQueueError, ControlEmailCycleError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
     except Exception:
@@ -203,6 +240,6 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if result.get("state") in {"ready", "accepted"} else 1
     if args.command == "send-push-test":
         return 0 if result.get("state") == "accepted" else 1
-    if args.command == "push-cycle":
+    if args.command in {"push-cycle", "control-email-cycle"}:
         return 1 if result.get("failed") or result.get("uncertain") else 0
     return 0

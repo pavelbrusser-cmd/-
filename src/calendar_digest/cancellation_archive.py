@@ -24,7 +24,7 @@ _EVENT_FIELDS = frozenset(field.name for field in fields(DigestEvent))
 _REQUIRED_TEXT = frozenset({
     "source_id", "calendar_id", "uid", "start", "end", "event_status", "participation",
 })
-_TEXT = _REQUIRED_TEXT | {"calendar_name", "title"}
+_TEXT = _REQUIRED_TEXT | {"calendar_name", "title", "account_email"}
 _OPTIONAL_TEXT = frozenset({
     "recurrence_id", "original_start", "original_end", "move_basis", "location",
 })
@@ -65,8 +65,10 @@ def _interval(start: str, end: str | None):
 
 def _event(payload: dict, *, cancelled=True) -> DigestEvent:
     try:
-        if not isinstance(payload, dict) or set(payload) != _EVENT_FIELDS:
+        if (not isinstance(payload, dict)
+                or set(payload) not in (_EVENT_FIELDS, _EVENT_FIELDS - {"account_email"})):
             raise ValueError
+        payload = {"account_email": "", **payload}
         for name in _TEXT:
             if not isinstance(payload[name], str) or (name in _REQUIRED_TEXT and not payload[name].strip()):
                 raise ValueError

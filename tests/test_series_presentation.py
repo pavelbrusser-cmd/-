@@ -146,6 +146,19 @@ class SeriesPresentationTests(unittest.TestCase):
         self.assertEqual(len(links), 2)
         self.assertTrue(all(attrs["aria-label"].endswith(event().title) for attrs in links))
 
+    def test_series_source_email_is_grouped_with_changes_without_turning_notice_into_action(self):
+        changed = replace(notice(), account_email="series@example.invalid")
+        moved = replace(event(), original_start="2026-10-14T11:00:00+03:00",
+                        original_end="2026-10-14T12:00:00+03:00", account_email="calendar@example.invalid")
+        html = render_email_html([moved], DAY, series_changes=[changed], action_links={})
+        self.assertIn("Адреса источников: calendar@example.invalid · series@example.invalid", html)
+        self.assertEqual(html.count('class="card-source-email"'), 2)
+        self.assertIn("Изменения в расписании · 2", html)
+        tags = Tags(html).elements
+        self.assertEqual(sum(attrs.get("class") == "series-change-card" for _, attrs in tags), 1)
+        self.assertEqual(sum(attrs.get("class") == "event-card" for _, attrs in tags), 1)
+        self.assertFalse(any(attrs.get("class") == "action" for _, attrs in tags))
+
     def test_preview_writes_notice_beside_current_events_and_keeps_it_after_reload(self):
         old = resource("20261013T090000Z")
         old = replace(old, data=old.data.replace("DURATION:PT1H", "DURATION:PT1H\r\nRRULE:FREQ=DAILY;COUNT=3"))

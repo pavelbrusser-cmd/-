@@ -190,7 +190,7 @@ def _range(start: str, end: str | None) -> str:
 
 def _plain_text(day: date, events: Iterable[DigestEvent], *, test: bool,
                 series_changes: Iterable[SeriesChangeNotice] = ()) -> str:
-    from .email_html import PARTICIPATION_LABELS, SOURCE_NAMES, STATUS_LABELS, WEEKDAYS
+    from .email_html import PARTICIPATION_LABELS, SECTIONS, SOURCE_NAMES, STATUS_LABELS, WEEKDAYS, digest_sections
     from .presentation import CATEGORY_LABELS, classify_event
 
     events = list(events)
@@ -199,15 +199,17 @@ def _plain_text(day: date, events: Iterable[DigestEvent], *, test: bool,
         lines.extend(["Проверочное письмо.", ""])
     if not events:
         lines.append("На этот день событий нет.")
-    for all_day, label in ((True, "На весь день"), (False, "По времени")):
-        group = [event for event in events if event.all_day == all_day]
-        if not group:
-            continue
-        lines.extend([label, ""])
-        for event in group:
+    for section, group in digest_sections(events):
+        lines.extend([SECTIONS[section][0], ""])
+        addresses = sorted({event.account_email for _, event in group if event.account_email})
+        if addresses:
+            lines.extend(["Источники: " + ", ".join(addresses), ""])
+        for _, event in group:
             lines.extend([event.title or "Без названия", _range(event.start, event.end)])
             source = SOURCE_NAMES.get(event.source_id, event.source_id)
             lines.append(f"{source} / {event.calendar_name}")
+            if event.account_email:
+                lines.append("Аккаунт: " + event.account_email)
             metadata = [CATEGORY_LABELS[classify_event(event)]]
             if event.recurring:
                 metadata.append("Повторяющееся событие")
@@ -236,6 +238,8 @@ def _plain_text(day: date, events: Iterable[DigestEvent], *, test: bool,
         for notice in notices:
             source = SOURCE_NAMES.get(notice.source_id, notice.source_id)
             lines.extend([notice.title or "Без названия", f"{source} / {notice.calendar_name}"])
+            if notice.account_email:
+                lines.append("Аккаунт: " + notice.account_email)
             for label, start, end, recurring, intervals in (
                 ("В сохранённом расписании", notice.old_anchor_start,
                  notice.old_anchor_end, notice.old_recurring, notice.old_intervals),

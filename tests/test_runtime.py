@@ -60,6 +60,25 @@ class RuntimeTests(unittest.TestCase):
         validate.assert_not_called()
         self.assertEqual(supervisor.call_args.args[0][-1][-1], "calendar_digest.push_scheduler")
 
+    def test_control_mail_has_independent_flag_and_isolates_credential_validation(self):
+        self.assertFalse(runtime.control_email_enabled({}))
+        self.assertTrue(runtime.control_email_enabled({"CONTROL_EMAIL_ENABLED": "true"}))
+        for value in ("1", "yes", "TRUE", "", "private-value"):
+            with self.subTest(value=value), self.assertRaises(runtime.RuntimeConfigurationError) as error:
+                runtime.control_email_enabled({"CONTROL_EMAIL_ENABLED": value})
+            self.assertNotIn("private-value", str(error.exception))
+        for mail, push in ((False, False), (True, False), (False, True), (True, True)):
+            with self.subTest(mail=mail, push=push), patch.dict(os.environ, {
+                "CONTROL_EMAIL_ENABLED": "true", "DIGEST_SCHEDULE_ENABLED": str(mail).lower(),
+                "PUSH_SCHEDULE_ENABLED": str(push).lower(), "SMTP_PASSWORD": "malformed-private-key",
+            }, clear=True), patch.object(runtime, "validate_smtp_settings") as validate, \
+                    patch.object(runtime, "supervise", return_value=0) as supervisor, redirect_stdout(StringIO()):
+                self.assertEqual(runtime.main(), 0)
+                self.assertEqual(validate.call_count, int(mail))
+                commands = supervisor.call_args.args[0]
+                self.assertEqual(len(commands), 2 + mail + push)
+                self.assertEqual(commands[-1][-1], "calendar_digest.control_email_scheduler")
+
     def test_port_is_a_valid_tcp_port_and_never_echoes_bad_input(self):
         self.assertEqual(runtime.service_port({}), 10000)
         self.assertEqual(runtime.service_port({"PORT": "65535"}), 65535)

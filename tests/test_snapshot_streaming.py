@@ -47,8 +47,13 @@ class StreamingSnapshotTests(unittest.TestCase):
             write_snapshot(path, snapshot)
             restored = read_snapshot(path)
             self.assertEqual(len(restored.previous), 1)
-            self.assertEqual(select_day(snapshot.current, date(2026, 10, 14), snapshot.previous),
-                             select_day(restored.current, date(2026, 10, 14), restored.previous))
+            selected = select_day(snapshot.current, date(2026, 10, 14), snapshot.previous)
+            restored_events = select_day(restored.current, date(2026, 10, 14), restored.previous)
+            # Snapshot history deliberately omits login addresses. Live
+            # collection supplies this display-only label on the next preview.
+            self.assertTrue(all(item.account_email == first.account_email for item in selected))
+            self.assertTrue(all(item.account_email == "" for item in restored_events))
+            self.assertEqual([replace(item, account_email="") for item in selected], restored_events)
             later = replace(resource("20261016T120000Z"), calendar_id="other-calendar")
             advanced = advance_snapshot([moved, later], restored)
             events = select_day(advanced.current, date(2026, 10, 14), advanced.previous)
