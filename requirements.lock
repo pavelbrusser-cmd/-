@@ -29,6 +29,6 @@ six==1.17.0
 typing_extensions==4.16.0
 tzdata==2026.5
 urllib3-future==2.25.902
-wassima==2.1.4
+wassima==2.1.5
 Werkzeug==3.1.9
 x-wr-timezone==2.0.1
