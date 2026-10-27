@@ -16,6 +16,7 @@ dependencies = [
     "gunicorn==23.0.0",
     "ijson==3.4.0.post0",
     "cryptography==50.0.0",
+    "wassima==2.1.5",
 ]
 
 [project.scripts]
